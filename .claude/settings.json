@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cmd=$(jq -r '.tool_input.command'); echo \"$cmd\" | grep -qE '^git commit' && (cargo fmt --check && cargo check && cargo test) || true",
+            "command": "cmd=$(jq -r '.tool_input.command'); if echo \"$cmd\" | grep -qE '^git commit'; then cargo fmt --check && cargo check && cargo test; fi",
             "timeout": 120,
             "statusMessage": "Running cargo fmt --check, check, test..."
           }

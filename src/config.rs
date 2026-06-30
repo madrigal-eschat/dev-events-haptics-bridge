@@ -18,10 +18,7 @@ impl Config {
                 bail!("rule has empty devices list");
             }
             for addr in devices {
-                let backend_name = addr
-                    .split_once('/')
-                    .context("device must be BACKEND/ID")?
-                    .0;
+                let backend_name = addr.split_once('/').context("device must be BACKEND/ID")?.0;
                 if !backend::is_known(backend_name) {
                     bail!("unknown backend '{}' in device '{}'", backend_name, addr);
                 }
@@ -200,9 +197,15 @@ mod tests {
 
     fn rule(device: &str, gesture: &str, speed: f32, scale: f32) -> Rule {
         Rule {
-            device_spec: DeviceSpec::One { device: device.into() },
+            device_spec: DeviceSpec::One {
+                device: device.into(),
+            },
             filter: Filter::default(),
-            gesture: GestureConfig { name: gesture.into(), speed, scale },
+            gesture: GestureConfig {
+                name: gesture.into(),
+                speed,
+                scale,
+            },
         }
     }
 
@@ -212,7 +215,11 @@ mod tests {
                 devices: vec![d0.into(), d1.into()],
             },
             filter: Filter::default(),
-            gesture: GestureConfig { name: gesture.into(), speed: 1.0, scale: 1.0 },
+            gesture: GestureConfig {
+                name: gesture.into(),
+                speed: 1.0,
+                scale: 1.0,
+            },
         }
     }
 
@@ -333,7 +340,11 @@ mod tests {
         let r = Rule {
             device_spec: DeviceSpec::Many { devices: vec![] },
             filter: Filter::default(),
-            gesture: GestureConfig { name: "pulse_short".into(), speed: 1.0, scale: 1.0 },
+            gesture: GestureConfig {
+                name: "pulse_short".into(),
+                speed: 1.0,
+                scale: 1.0,
+            },
         };
         let err = cfg(vec![r]).validate().unwrap_err();
         assert!(err.to_string().contains("empty"));
