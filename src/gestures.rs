@@ -11,41 +11,39 @@ pub struct Event {
 
 impl Event {
     pub const fn new(duration_ms: u32, magnitude: f32, device: u8) -> Self {
-        Self { duration_ms, magnitude, device }
+        Self {
+            duration_ms,
+            magnitude,
+            device,
+        }
     }
 }
 
 // ── Single device ─────────────────────────────────────────────────────────────
 
 /// One 50 ms burst.
-pub const PULSE_SHORT: &[Event] = &[
-    Event::new(50,  1.0, 0),
-];
+pub const PULSE_SHORT: &[Event] = &[Event::new(50, 1.0, 0)];
 
 /// One 300 ms burst.
-pub const PULSE_MEDIUM: &[Event] = &[
-    Event::new(300, 1.0, 0),
-];
+pub const PULSE_MEDIUM: &[Event] = &[Event::new(300, 1.0, 0)];
 
 /// One 1000 ms burst.
-pub const PULSE_LONG: &[Event] = &[
-    Event::new(1000, 1.0, 0),
-];
+pub const PULSE_LONG: &[Event] = &[Event::new(1000, 1.0, 0)];
 
 /// Two 50 ms pulses, 100 ms gap between.
 pub const DOUBLE_SHORT: &[Event] = &[
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
     Event::new(100, 0.0, 0),
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
 ];
 
 /// Three 50 ms pulses, 100 ms gaps between.
 pub const TRIPLE_SHORT: &[Event] = &[
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
     Event::new(100, 0.0, 0),
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
     Event::new(100, 0.0, 0),
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
 ];
 
 /// Three 100 ms pulses, 200 ms gaps between — slower cadence.
@@ -60,56 +58,75 @@ pub const TRIPLE_SLOW: &[Event] = &[
 // ── Two devices ───────────────────────────────────────────────────────────────
 
 /// One 300 ms burst on both devices simultaneously.
-pub const BOTH_MEDIUM: &[Event] = &[
-    Event::new(300,  1.0, 0),
-    Event::new(300,  1.0, 1),
-];
+pub const BOTH_MEDIUM: &[Event] = &[Event::new(300, 1.0, 0), Event::new(300, 1.0, 1)];
 
 /// One 1000 ms burst on both devices simultaneously.
-pub const BOTH_LONG: &[Event] = &[
-    Event::new(1000, 1.0, 0),
-    Event::new(1000, 1.0, 1),
-];
+pub const BOTH_LONG: &[Event] = &[Event::new(1000, 1.0, 0), Event::new(1000, 1.0, 1)];
 
 /// 300 ms crossfade: device 0 fades out while device 1 fades in (constant total power).
 /// 6 steps × 50 ms.
 pub const CROSSFADE_MEDIUM: &[Event] = &[
-    Event::new(50, 1.00, 0), Event::new(50, 0.00, 1),
-    Event::new(50, 0.80, 0), Event::new(50, 0.20, 1),
-    Event::new(50, 0.60, 0), Event::new(50, 0.40, 1),
-    Event::new(50, 0.40, 0), Event::new(50, 0.60, 1),
-    Event::new(50, 0.20, 0), Event::new(50, 0.80, 1),
-    Event::new(50, 0.00, 0), Event::new(50, 1.00, 1),
+    Event::new(50, 1.00, 0),
+    Event::new(50, 0.00, 1),
+    Event::new(50, 0.80, 0),
+    Event::new(50, 0.20, 1),
+    Event::new(50, 0.60, 0),
+    Event::new(50, 0.40, 1),
+    Event::new(50, 0.40, 0),
+    Event::new(50, 0.60, 1),
+    Event::new(50, 0.20, 0),
+    Event::new(50, 0.80, 1),
+    Event::new(50, 0.00, 0),
+    Event::new(50, 1.00, 1),
 ];
 
 /// 1000 ms crossfade: device 0 fades out while device 1 fades in (constant total power).
 /// 10 steps × 100 ms.
 pub const CROSSFADE_LONG: &[Event] = &[
-    Event::new(100, 1.00, 0), Event::new(100, 0.00, 1),
-    Event::new(100, 0.89, 0), Event::new(100, 0.11, 1),
-    Event::new(100, 0.78, 0), Event::new(100, 0.22, 1),
-    Event::new(100, 0.67, 0), Event::new(100, 0.33, 1),
-    Event::new(100, 0.56, 0), Event::new(100, 0.44, 1),
-    Event::new(100, 0.44, 0), Event::new(100, 0.56, 1),
-    Event::new(100, 0.33, 0), Event::new(100, 0.67, 1),
-    Event::new(100, 0.22, 0), Event::new(100, 0.78, 1),
-    Event::new(100, 0.11, 0), Event::new(100, 0.89, 1),
-    Event::new(100, 0.00, 0), Event::new(100, 1.00, 1),
+    Event::new(100, 1.00, 0),
+    Event::new(100, 0.00, 1),
+    Event::new(100, 0.89, 0),
+    Event::new(100, 0.11, 1),
+    Event::new(100, 0.78, 0),
+    Event::new(100, 0.22, 1),
+    Event::new(100, 0.67, 0),
+    Event::new(100, 0.33, 1),
+    Event::new(100, 0.56, 0),
+    Event::new(100, 0.44, 1),
+    Event::new(100, 0.44, 0),
+    Event::new(100, 0.56, 1),
+    Event::new(100, 0.33, 0),
+    Event::new(100, 0.67, 1),
+    Event::new(100, 0.22, 0),
+    Event::new(100, 0.78, 1),
+    Event::new(100, 0.11, 0),
+    Event::new(100, 0.89, 1),
+    Event::new(100, 0.00, 0),
+    Event::new(100, 1.00, 1),
 ];
 
 /// Two 50 ms pulses on both devices simultaneously, 100 ms gap between.
 pub const BOTH_DOUBLE_SHORT: &[Event] = &[
-    Event::new(50,  1.0, 0), Event::new(50,  1.0, 1),
-    Event::new(100, 0.0, 0), Event::new(100, 0.0, 1),
-    Event::new(50,  1.0, 0), Event::new(50,  1.0, 1),
+    Event::new(50, 1.0, 0),
+    Event::new(50, 1.0, 1),
+    Event::new(100, 0.0, 0),
+    Event::new(100, 0.0, 1),
+    Event::new(50, 1.0, 0),
+    Event::new(50, 1.0, 1),
 ];
+
+/// Zero magnitude on device 0 for 1000 ms — silences haptics on the primary device.
+pub const STOP: &[Event] = &[Event::new(1000, 0.0, 0)];
+
+/// Zero magnitude on both devices simultaneously for 1000 ms — silences all haptics.
+pub const STOP_ALL: &[Event] = &[Event::new(1000, 0.0, 0), Event::new(1000, 0.0, 1)];
 
 /// Two 50 ms pulses alternating: first device 0, then device 1.
 /// Device 1 waits 150 ms (pulse + gap) before firing.
 pub const ALTERNATE_DOUBLE_SHORT: &[Event] = &[
-    Event::new(50,  1.0, 0),
+    Event::new(50, 1.0, 0),
     Event::new(150, 0.0, 1),
-    Event::new(50,  1.0, 1),
+    Event::new(50, 1.0, 1),
 ];
 
 // ── Lookup ────────────────────────────────────────────────────────────────────
@@ -117,18 +134,20 @@ pub const ALTERNATE_DOUBLE_SHORT: &[Event] = &[
 /// Returns the named gesture, or `None` if unknown.
 pub fn lookup(name: &str) -> Option<&'static [Event]> {
     match name {
-        "pulse_short"          => Some(PULSE_SHORT),
-        "pulse_medium"         => Some(PULSE_MEDIUM),
-        "pulse_long"           => Some(PULSE_LONG),
-        "double_short"         => Some(DOUBLE_SHORT),
-        "triple_short"         => Some(TRIPLE_SHORT),
-        "triple_slow"          => Some(TRIPLE_SLOW),
-        "both_medium"          => Some(BOTH_MEDIUM),
-        "both_long"            => Some(BOTH_LONG),
-        "crossfade_medium"     => Some(CROSSFADE_MEDIUM),
-        "crossfade_long"       => Some(CROSSFADE_LONG),
-        "both_double_short"    => Some(BOTH_DOUBLE_SHORT),
+        "pulse_short" => Some(PULSE_SHORT),
+        "pulse_medium" => Some(PULSE_MEDIUM),
+        "pulse_long" => Some(PULSE_LONG),
+        "double_short" => Some(DOUBLE_SHORT),
+        "triple_short" => Some(TRIPLE_SHORT),
+        "triple_slow" => Some(TRIPLE_SLOW),
+        "both_medium" => Some(BOTH_MEDIUM),
+        "both_long" => Some(BOTH_LONG),
+        "crossfade_medium" => Some(CROSSFADE_MEDIUM),
+        "crossfade_long" => Some(CROSSFADE_LONG),
+        "both_double_short" => Some(BOTH_DOUBLE_SHORT),
         "alternate_double_short" => Some(ALTERNATE_DOUBLE_SHORT),
+        "stop" => Some(STOP),
+        "stop_all" => Some(STOP_ALL),
         _ => None,
     }
 }
@@ -160,11 +179,20 @@ mod tests {
     #[test]
     fn lookup_all_named_gestures() {
         let names = [
-            "pulse_short", "pulse_medium", "pulse_long",
-            "double_short", "triple_short", "triple_slow",
-            "both_medium", "both_long",
-            "crossfade_medium", "crossfade_long",
-            "both_double_short", "alternate_double_short",
+            "pulse_short",
+            "pulse_medium",
+            "pulse_long",
+            "double_short",
+            "triple_short",
+            "triple_slow",
+            "both_medium",
+            "both_long",
+            "crossfade_medium",
+            "crossfade_long",
+            "both_double_short",
+            "alternate_double_short",
+            "stop",
+            "stop_all",
         ];
         for name in names {
             assert!(lookup(name).is_some(), "lookup({name}) returned None");
