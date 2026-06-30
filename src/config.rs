@@ -116,20 +116,20 @@ pub struct Filter {
 
 impl Filter {
     pub fn matches(&self, event: &CloudEvent) -> bool {
-        if let Some(pat) = &self.type_ {
-            if !glob_match(pat, &event.type_) {
-                return false;
-            }
+        if let Some(pat) = &self.type_
+            && !glob_match(pat, &event.type_)
+        {
+            return false;
         }
-        if let Some(pat) = &self.source {
-            if !glob_match(pat, &event.source) {
-                return false;
-            }
+        if let Some(pat) = &self.source
+            && !glob_match(pat, &event.source)
+        {
+            return false;
         }
-        if let Some(pat) = &self.sourcetype {
-            if !glob_match(pat, &event.sourcetype) {
-                return false;
-            }
+        if let Some(pat) = &self.sourcetype
+            && !glob_match(pat, &event.sourcetype)
+        {
+            return false;
         }
         if let Some(pat) = &self.subject {
             match &event.subject {

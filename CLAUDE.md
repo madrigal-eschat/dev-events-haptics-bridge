@@ -8,12 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo check          # type-check without building
 cargo fmt            # format (run before committing)
 cargo fmt --check    # check formatting (CI gate)
+cargo clippy --all-targets -- -D warnings   # lint (pre-commit gate)
 cargo test           # run all tests
 cargo test <name>    # run a single test by name substring
 cargo build          # build binary (output: target/debug/haptics)
 ```
 
-CI runs `cargo fmt --check`, `cargo check`, and `cargo test` — all three must pass before committing. A pre-commit hook enforces this automatically.
+CI runs `cargo fmt --check`, `cargo check`, and `cargo test` — all three must pass before committing. A pre-commit hook enforces `cargo fmt`, `cargo check`, `cargo clippy`, and `cargo test` automatically.
 
 ## Architecture
 

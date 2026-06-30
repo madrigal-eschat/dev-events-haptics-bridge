@@ -6,9 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cmd=$(jq -r '.tool_input.command'); if echo \"$cmd\" | grep -qE '^git commit'; then cargo fmt && cargo check && cargo test; fi",
-            "timeout": 120,
-            "statusMessage": "Running cargo fmt, check, test..."
+            "command": "cmd=$(jq -r '.tool_input.command'); if echo \"$cmd\" | grep -qE '^git commit'; then cargo fmt && cargo check && cargo clippy --all-targets -- -D warnings && cargo test; fi",
+            "timeout": 180,
+            "statusMessage": "Running cargo fmt, check, clippy, test..."
           }
         ]
       }
