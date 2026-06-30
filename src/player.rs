@@ -38,7 +38,11 @@ impl Player {
             thread::spawn(move || player_thread(state, condvar, callback))
         };
 
-        Self { state, condvar, thread: Some(thread) }
+        Self {
+            state,
+            condvar,
+            thread: Some(thread),
+        }
     }
 
     /// Append events to the back of the queue.
@@ -100,11 +104,7 @@ impl Drop for Player {
     }
 }
 
-fn player_thread(
-    state: Arc<Mutex<State>>,
-    condvar: Arc<Condvar>,
-    callback: impl Fn(Event),
-) {
+fn player_thread(state: Arc<Mutex<State>>, condvar: Arc<Condvar>, callback: impl Fn(Event)) {
     loop {
         // Block until there is an event to emit. Tracking device magnitude
         // happens here under the lock so clear() always sees up-to-date state.
@@ -130,8 +130,8 @@ fn player_thread(
         if event.duration_ms > 0 {
             let mut s = state.lock().unwrap();
             if !s.woken {
-                let (guard, _) =
-                    condvar.wait_timeout(s, Duration::from_millis(event.duration_ms as u64))
+                let (guard, _) = condvar
+                    .wait_timeout(s, Duration::from_millis(event.duration_ms as u64))
                     .unwrap();
                 s = guard;
             }
