@@ -8,6 +8,7 @@ pub struct Config {
     pub broker: BrokerConfig,
     pub topics: Vec<String>,
     pub rules: Vec<Rule>,
+    pub http: Option<HttpConfig>,
 }
 
 impl Config {
@@ -72,6 +73,16 @@ pub struct BrokerConfig {
 
 fn default_port() -> u16 {
     1883
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct HttpConfig {
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+}
+
+fn default_http_bind() -> String {
+    "127.0.0.1:8080".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +244,7 @@ mod tests {
             },
             topics: vec![],
             rules,
+            http: None,
         }
     }
 
@@ -576,5 +588,44 @@ mod tests {
             ..Default::default()
         };
         assert!(!f2.matches(&any_event()));
+    }
+
+    #[test]
+    fn parse_config_without_http_section() {
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.http.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_http_section_defaults_bind() {
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+http: {}
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.http.unwrap().bind, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn parse_config_with_http_section_custom_bind() {
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+http:
+  bind: "0.0.0.0:9000"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.http.unwrap().bind, "0.0.0.0:9000");
     }
 }
