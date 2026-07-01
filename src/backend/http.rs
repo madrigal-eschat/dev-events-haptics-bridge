@@ -31,9 +31,7 @@ impl HttpBackend {
         }
     }
 
-    // Only read by tests (this crate has no lib target, so the non-test
-    // build of the `haptics` bin sees this as unused without the allow).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn bound_addr(&self) -> Option<std::net::SocketAddr> {
         *self.bound_addr.lock().unwrap()
     }
