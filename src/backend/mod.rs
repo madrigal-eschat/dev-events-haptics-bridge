@@ -1,5 +1,7 @@
 use crate::gestures::Event;
 
+pub mod http;
+
 pub enum DeviceList {
     Anything,
     List(Vec<String>),
