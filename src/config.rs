@@ -75,7 +75,7 @@ fn default_port() -> u16 {
     1883
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct HttpConfig {
     #[serde(default = "default_http_bind")]
     pub bind: String,
@@ -83,6 +83,14 @@ pub struct HttpConfig {
 
 fn default_http_bind() -> String {
     "127.0.0.1:8080".to_string()
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_http_bind(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,5 +635,22 @@ http:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.http.unwrap().bind, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn http_config_default_yields_documented_bind() {
+        // Regression test: when config.http is None, unwrap_or_default() must
+        // yield the documented bind address, not an empty string.
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.http.is_none());
+        // This is what backend/mod.rs does: unwrap_or_default() when http is None
+        let bind = cfg.http.clone().unwrap_or_default().bind;
+        assert_eq!(bind, "127.0.0.1:8080");
     }
 }
