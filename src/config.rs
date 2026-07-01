@@ -85,6 +85,10 @@ fn default_http_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
 
+/// Manual impl (not derived) because `#[serde(default = "default_http_bind")]`
+/// only applies during deserialization of a present `http:` section — it has
+/// no effect on `Default::default()`, which is what `unwrap_or_default()` uses
+/// when the whole `http:` section is absent from the config.
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {

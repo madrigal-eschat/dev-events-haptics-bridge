@@ -29,9 +29,10 @@ async fn main() -> Result<()> {
         for addr in rule.device_spec.as_slice() {
             let backend_name = addr.split_once('/').expect("validated").0;
             if !backends.contains_key(backend_name) {
-                let backend = backend::create(backend_name, &config)?;
-                backend.startup()?;
-                backends.insert(backend_name.to_string(), backend);
+                backends.insert(
+                    backend_name.to_string(),
+                    backend::create(backend_name, &config)?,
+                );
             }
         }
     }
@@ -44,6 +45,10 @@ async fn main() -> Result<()> {
                 return Err(e);
             }
         }
+    }
+
+    for backend in backends.values() {
+        backend.startup()?;
     }
 
     let client_id = config

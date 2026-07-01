@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
@@ -18,6 +18,7 @@ pub struct HttpBackend {
     events: EventBuffer,
     bind: String,
     shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    bound_addr: Mutex<Option<std::net::SocketAddr>>,
 }
 
 impl HttpBackend {
@@ -26,7 +27,15 @@ impl HttpBackend {
             events: Arc::new(Mutex::new(VecDeque::new())),
             bind,
             shutdown_tx: Mutex::new(None),
+            bound_addr: Mutex::new(None),
         }
+    }
+
+    // Only read by tests (this crate has no lib target, so the non-test
+    // build of the `haptics` bin sees this as unused without the allow).
+    #[allow(dead_code)]
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        *self.bound_addr.lock().unwrap()
     }
 }
 
@@ -43,20 +52,22 @@ fn build_router(events: EventBuffer) -> Router {
 
 impl Backend for HttpBackend {
     fn startup(&self) -> Result<()> {
+        let std_listener = std::net::TcpListener::bind(&self.bind)
+            .with_context(|| format!("http backend: failed to bind {}", self.bind))?;
+        std_listener
+            .set_nonblocking(true)
+            .context("http backend: failed to set listener non-blocking")?;
+        let bound_addr = std_listener.local_addr().ok();
+        *self.bound_addr.lock().unwrap() = bound_addr;
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .context("http backend: failed to register listener with tokio runtime")?;
+
         let events = Arc::clone(&self.events);
-        let bind = self.bind.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         *self.shutdown_tx.lock().unwrap() = Some(tx);
 
         tokio::spawn(async move {
             let app = build_router(events);
-            let listener = match tokio::net::TcpListener::bind(&bind).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    eprintln!("http backend: failed to bind {bind}: {e}");
-                    return;
-                }
-            };
             let server = axum::serve(listener, app).with_graceful_shutdown(async {
                 let _ = rx.await;
             });
@@ -184,11 +195,43 @@ mod tests {
     #[tokio::test]
     async fn startup_serves_events_then_teardown_stops_it() {
         let backend = HttpBackend::new("127.0.0.1:0".to_string());
-        // Port 0 means we can't predict the bound address from here, so this
-        // test exercises startup/teardown for panics/errors only, not a real
-        // HTTP round trip (the route-serving behavior is already covered by
-        // route_returns_events_joined_by_newline against the router directly).
         backend.startup().unwrap();
+        let addr = backend
+            .bound_addr()
+            .expect("startup should have bound a port");
+
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        // The spawned server task may not have reached accept() yet; retry briefly.
+        let mut stream = None;
+        for _ in 0..50 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let mut stream = stream.expect("server should accept a connection shortly after startup");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.contains("0 Event"),
+            "response body missing event line: {response}"
+        );
+
         backend.teardown().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "listener should stop accepting connections after teardown"
+        );
     }
 }
