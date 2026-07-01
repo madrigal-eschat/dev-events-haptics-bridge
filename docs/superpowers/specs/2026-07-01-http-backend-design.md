@@ -29,7 +29,12 @@ pub enum DeviceList {
 pub trait Backend: Send + Sync {
     fn startup(&self) -> anyhow::Result<()>;
     fn teardown(&self) -> anyhow::Result<()>;
+
+    /// On failure, the returned error is printed to the console (stderr) by
+    /// the caller (see main.rs's device validation pass) — implementors just
+    /// return a descriptive `Err`, they don't print anything themselves.
     fn validate_device(&self, device_id: &str) -> anyhow::Result<()>;
+
     fn list_devices(&self) -> anyhow::Result<DeviceList>;
     fn send_event(&self, device_id: String, event: &Event);
 }
@@ -116,9 +121,10 @@ as it does today (backends aren't instantiated at that point, so trait-level
 A **new second validation pass** runs in `main.rs`, immediately after the
 `backends` map is built (before subscribing to MQTT topics): for every rule's
 device address, look up the backend by name and call
-`backends[backend_name].validate_device(device_id)?`. This catches invalid IDs
-(e.g. `http/1`, since only `http/0` is valid) at startup, before the bridge
-starts consuming events.
+`backends[backend_name].validate_device(device_id)`. On `Err`, `main.rs` prints
+the error to stderr (e.g. `eprintln!("{e}")`) and then returns/bails, stopping
+startup. This catches invalid IDs (e.g. `http/1`, since only `http/0` is valid)
+before the bridge starts consuming events.
 
 ---
 
