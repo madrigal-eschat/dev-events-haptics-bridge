@@ -50,12 +50,16 @@ impl Backend for StdoutBackend {
 }
 
 pub fn is_known(name: &str) -> bool {
-    matches!(name, "stdout")
+    matches!(name, "stdout" | "http")
 }
 
-pub fn create(name: &str) -> anyhow::Result<Box<dyn Backend>> {
+pub fn create(name: &str, config: &crate::config::Config) -> anyhow::Result<Box<dyn Backend>> {
     match name {
         "stdout" => Ok(Box::new(StdoutBackend)),
+        "http" => {
+            let bind = config.http.clone().unwrap_or_default().bind;
+            Ok(Box::new(http::HttpBackend::new(bind)))
+        }
         other => anyhow::bail!("unknown backend: {other}"),
     }
 }
@@ -63,23 +67,51 @@ pub fn create(name: &str) -> anyhow::Result<Box<dyn Backend>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BrokerConfig, Config};
+
+    fn test_config() -> Config {
+        Config {
+            broker: BrokerConfig {
+                host: "localhost".into(),
+                port: 1883,
+                client_id: None,
+                auth: None,
+            },
+            topics: vec![],
+            rules: vec![],
+            http: None,
+        }
+    }
 
     #[test]
     fn create_known_backends_succeed() {
-        assert!(create("stdout").is_ok());
+        assert!(create("stdout", &test_config()).is_ok());
+        assert!(create("http", &test_config()).is_ok());
     }
 
     #[test]
     fn create_unknown_backend_errors() {
-        let err = create("nonexistent").err().expect("expected error");
+        let err = create("nonexistent", &test_config())
+            .err()
+            .expect("expected error");
         assert!(err.to_string().contains("nonexistent"), "{err}");
     }
 
     #[test]
-    fn is_known_stdout() {
+    fn is_known_stdout_and_http() {
         assert!(is_known("stdout"));
+        assert!(is_known("http"));
         assert!(!is_known("nonexistent"));
         assert!(!is_known("STDOUT"));
+    }
+
+    #[test]
+    fn create_http_uses_configured_bind() {
+        let mut config = test_config();
+        config.http = Some(crate::config::HttpConfig {
+            bind: "127.0.0.1:9999".to_string(),
+        });
+        assert!(create("http", &config).is_ok());
     }
 
     #[test]

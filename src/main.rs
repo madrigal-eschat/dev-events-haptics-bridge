@@ -29,7 +29,10 @@ async fn main() -> Result<()> {
         for addr in rule.device_spec.as_slice() {
             let backend_name = addr.split_once('/').expect("validated").0;
             if !backends.contains_key(backend_name) {
-                backends.insert(backend_name.to_string(), backend::create(backend_name)?);
+                backends.insert(
+                    backend_name.to_string(),
+                    backend::create(backend_name, &config)?,
+                );
             }
         }
     }
