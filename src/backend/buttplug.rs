@@ -537,6 +537,37 @@ fn format_device_id(lookup: &DeviceLookup, actuator: Option<u32>) -> String {
     }
 }
 
+fn is_secure_websocket(server: &str) -> bool {
+    server.starts_with("wss://")
+}
+
+struct Backoff {
+    initial_ms: u64,
+    current_ms: u64,
+    max_ms: u64,
+}
+
+impl Backoff {
+    fn new(max_ms: u64) -> Self {
+        let initial_ms = 1_000u64.min(max_ms.max(1));
+        Self {
+            initial_ms,
+            current_ms: initial_ms,
+            max_ms: max_ms.max(initial_ms),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current_ms = self.initial_ms;
+    }
+
+    fn next(&mut self) -> Duration {
+        let delay = Duration::from_millis(self.current_ms);
+        self.current_ms = (self.current_ms * 2).min(self.max_ms);
+        delay
+    }
+}
+
 fn choose_actuator(
     actuators: &[Actuator],
     selected: Option<&HashSet<Actuator>>,
@@ -1063,6 +1094,39 @@ mod tests {
             None
         );
         assert_eq!(classify_output_types(&[]), None);
+    }
+
+    #[test]
+    fn is_secure_websocket_detects_wss_scheme() {
+        assert!(is_secure_websocket("wss://example.com:12345"));
+        assert!(!is_secure_websocket("ws://example.com:12345"));
+        assert!(!is_secure_websocket("ws://localhost:12345"));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_max_then_holds() {
+        let mut backoff = Backoff::new(8_000);
+        assert_eq!(backoff.next(), Duration::from_millis(1_000));
+        assert_eq!(backoff.next(), Duration::from_millis(2_000));
+        assert_eq!(backoff.next(), Duration::from_millis(4_000));
+        assert_eq!(backoff.next(), Duration::from_millis(8_000));
+        assert_eq!(backoff.next(), Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn backoff_reset_returns_to_initial_delay() {
+        let mut backoff = Backoff::new(30_000);
+        backoff.next();
+        backoff.next();
+        backoff.reset();
+        assert_eq!(backoff.next(), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn backoff_max_below_initial_delay_is_clamped_to_max() {
+        let mut backoff = Backoff::new(500);
+        assert_eq!(backoff.next(), Duration::from_millis(500));
+        assert_eq!(backoff.next(), Duration::from_millis(500));
     }
 
 }
