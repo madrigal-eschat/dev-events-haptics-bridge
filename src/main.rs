@@ -124,12 +124,9 @@ fn dispatch_rule(
         .and_then(|addr| addr.split_once('/'))
         .expect("validated at startup")
         .0;
-    let backend_prefix = format!("{backend_name}/");
     let resolved_devices = backends[backend_name].resolve_device_ids(devices)?;
     for haptic_event in events {
-        let device_id = resolved_devices[haptic_event.device as usize]
-            .strip_prefix(&backend_prefix)
-            .unwrap_or(&resolved_devices[haptic_event.device as usize]);
+        let device_id = &resolved_devices[haptic_event.device as usize];
         backends[backend_name].send_event(device_id.to_string(), haptic_event);
     }
     Ok(())
@@ -194,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_device_ids_with_backend_prefix_are_resolved_once_per_firing() {
+    fn rule_device_ids_with_backend_prefix_are_preserved_end_to_end() {
         let backend = RecordingBackend::default();
         let handle = backend.clone();
 
@@ -212,7 +209,7 @@ mod tests {
         assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
         assert_eq!(
             handle.sent_device_ids.lock().unwrap().as_slice(),
-            &["0".to_string(), "1".to_string()]
+            &["stdout/0".to_string(), "stdout/1".to_string()]
         );
     }
 
