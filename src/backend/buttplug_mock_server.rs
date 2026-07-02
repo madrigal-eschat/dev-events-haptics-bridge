@@ -7,6 +7,8 @@
 //! than hand-written JSON, so the wire format always matches what the
 //! client's schema validator expects.
 
+#![allow(dead_code)] // Module is consumed by integration tests added in a later task
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
