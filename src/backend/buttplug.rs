@@ -42,19 +42,9 @@ pub struct ButtplugTelemetry {
 
 #[derive(Debug, Clone, PartialEq)]
 enum ButtplugCommand {
-    Vibrate {
-        magnitude: f32,
-        frequency: f32,
-    },
-    Linear {
-        position: f32,
-        duration_ms: u32,
-    },
-    Rotate {
-        speed: f32,
-        clockwise: bool,
-        duration_ms: u32,
-    },
+    Vibrate { magnitude: f32 },
+    Linear { position: f32, duration_ms: u32 },
+    Rotate { speed: f32 },
 }
 
 #[derive(Debug, Clone)]
@@ -479,24 +469,13 @@ impl ButtplugBackend {
 fn translate_event(kind: ActuatorKind, event: &Event) -> Option<ButtplugCommand> {
     let magnitude = event.magnitude.abs().clamp(0.0, 1.0);
     Some(match kind {
-        ActuatorKind::Vibrate => ButtplugCommand::Vibrate {
-            magnitude,
-            frequency: magnitude,
-        },
+        ActuatorKind::Vibrate => ButtplugCommand::Vibrate { magnitude },
         ActuatorKind::Linear => ButtplugCommand::Linear {
             position: magnitude,
             duration_ms: event.duration_ms,
         },
-        ActuatorKind::Rotate => ButtplugCommand::Rotate {
-            speed: magnitude,
-            clockwise: rotate_clockwise_from_event(event),
-            duration_ms: event.duration_ms,
-        },
+        ActuatorKind::Rotate => ButtplugCommand::Rotate { speed: magnitude },
     })
-}
-
-fn rotate_clockwise_from_event(event: &Event) -> bool {
-    !event.magnitude.is_sign_negative() && event.device.is_multiple_of(2)
 }
 
 fn parse_device_id(device_id: &str) -> Result<(DeviceLookup, Option<u32>)> {
@@ -899,25 +878,17 @@ mod tests {
     }
 
     #[test]
-    fn translate_rotate_event_uses_direction_mapping() {
+    fn translate_rotate_event_uses_magnitude_as_speed() {
         let event = Event::new(80, 0.75, 1);
         assert_eq!(
             translate_event(ActuatorKind::Rotate, &event),
-            Some(ButtplugCommand::Rotate {
-                speed: 0.75,
-                clockwise: false,
-                duration_ms: 80,
-            })
+            Some(ButtplugCommand::Rotate { speed: 0.75 })
         );
 
         let event = Event::new(80, -0.75, 0);
         assert_eq!(
             translate_event(ActuatorKind::Rotate, &event),
-            Some(ButtplugCommand::Rotate {
-                speed: 0.75,
-                clockwise: false,
-                duration_ms: 80,
-            })
+            Some(ButtplugCommand::Rotate { speed: 0.75 })
         );
     }
 
@@ -938,10 +909,7 @@ mod tests {
         let event = Event::new(80, 0.50, 0);
         assert_eq!(
             translate_event(ActuatorKind::Vibrate, &event),
-            Some(ButtplugCommand::Vibrate {
-                magnitude: 0.50,
-                frequency: 0.50,
-            })
+            Some(ButtplugCommand::Vibrate { magnitude: 0.50 })
         );
     }
 
@@ -1039,14 +1007,4 @@ mod tests {
         backend.teardown().unwrap();
     }
 
-    #[test]
-    fn rotate_direction_is_even_slot_clockwise_and_negative_overrides() {
-        let positive_even = Event::new(80, 0.75, 0);
-        let positive_odd = Event::new(80, 0.75, 1);
-        let negative_even = Event::new(80, -0.75, 0);
-
-        assert!(rotate_clockwise_from_event(&positive_even));
-        assert!(!rotate_clockwise_from_event(&positive_odd));
-        assert!(!rotate_clockwise_from_event(&negative_even));
-    }
 }
