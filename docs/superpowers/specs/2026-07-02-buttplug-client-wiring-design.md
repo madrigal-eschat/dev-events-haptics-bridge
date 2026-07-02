@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-02
 **Scope:** Replace the buttplug backend's hand-rolled, never-connected protocol stub with a real connection to Intiface/Buttplug servers using the official `buttplug_client` crate.
-**Status:** Draft — pending review
+**Status:** Implemented
 **Supersedes:** Protocol/dependency sections of `2026-06-30-buttplug-backend-design.md`. That spec's `ButtplugBackend` sync facade, `WorkerState` machine, `DeviceLookup`, percent-encoding, and device-address format (`BACKEND/lookup/actuator`) are all still correct and unchanged — only the never-implemented "ConnectionManager" pieces (WebSocket I/O, device scan, protocol serialization, command translation) are being replaced.
 
 ---
