@@ -81,6 +81,32 @@ impl ButtplugBackend {
         }
     }
 
+    fn startup_with_runtime<F>(&self, build_runtime: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<tokio::runtime::Runtime>,
+    {
+        if self.tx.lock().unwrap().is_some() {
+            return Ok(());
+        }
+
+        let runtime = build_runtime()?;
+        let (tx, rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let device_cache = Arc::clone(&self.device_cache);
+        let processed_jobs = Arc::clone(&self.processed_jobs);
+        std::thread::Builder::new()
+            .name("buttplug-backend".to_string())
+            .spawn(move || {
+                runtime.block_on(run_worker(rx, shutdown_rx, device_cache, processed_jobs));
+            })?;
+
+        *self.tx.lock().unwrap() = Some(tx);
+        *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+
+        Ok(())
+    }
+
     #[cfg(test)]
     fn seed_device(&self, lookup: DeviceLookup, actuator_kinds: Vec<ActuatorKind>) {
         self.seed_device_aliases(vec![lookup], actuator_kinds);
@@ -106,26 +132,13 @@ impl ButtplugBackend {
 
 impl Backend for ButtplugBackend {
     fn startup(&self) -> Result<()> {
-        if self.tx.lock().unwrap().is_some() {
-            return Ok(());
-        }
-
-        let (tx, rx) = mpsc::channel(64);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        *self.tx.lock().unwrap() = Some(tx);
-        *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
-
-        let device_cache = Arc::clone(&self.device_cache);
-        let processed_jobs = Arc::clone(&self.processed_jobs);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        std::thread::spawn(move || {
-            runtime.block_on(run_worker(rx, shutdown_rx, device_cache, processed_jobs));
-        });
-
-        Ok(())
+        self.startup_with_runtime(|| {
+            Ok(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?,
+            )
+        })
     }
 
     fn teardown(&self) -> Result<()> {
@@ -675,5 +688,31 @@ mod tests {
         backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_failure_does_not_leave_backend_half_initialized() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
+
+        let err = backend
+            .startup_with_runtime(|| Err(anyhow::anyhow!("runtime build failed")))
+            .unwrap_err();
+        assert!(err.to_string().contains("runtime build failed"));
+        assert!(backend.tx.lock().unwrap().is_none());
+        assert!(backend.shutdown_tx.lock().unwrap().is_none());
+
+        backend.startup().unwrap();
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        for _ in 0..100 {
+            if backend.processed_jobs.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
+        backend.teardown().unwrap();
     }
 }
