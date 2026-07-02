@@ -32,6 +32,14 @@ struct Actuator {
     kind: ActuatorKind,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ButtplugTelemetry {
+    processed_jobs: usize,
+    dropped_unstarted: usize,
+    dropped_invalid_device: usize,
+    dropped_full: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ButtplugCommand {
     Vibrate {
@@ -156,18 +164,24 @@ impl ButtplugBackend {
         }
     }
 
-    fn wait_for_worker_shutdown(&self, timeout: Duration) {
+    fn wait_for_worker_shutdown(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
 
         loop {
             self.reclaim_stopped_worker();
 
             if matches!(*self.state.lock().unwrap(), WorkerState::Stopped) {
-                return;
+                return Ok(());
             }
 
             if Instant::now() >= deadline {
-                return;
+                let telemetry = self.telemetry_snapshot();
+                eprintln!(
+                    "buttplug backend: timed out waiting for worker shutdown after {timeout:?} (telemetry: {telemetry:?})"
+                );
+                bail!(
+                    "buttplug backend: worker shutdown timed out after {timeout:?} (telemetry: {telemetry:?})"
+                );
             }
 
             std::thread::sleep(Duration::from_millis(5));
@@ -231,7 +245,7 @@ impl Backend for ButtplugBackend {
         };
 
         if shutdown_requested {
-            self.wait_for_worker_shutdown(Duration::from_millis(500));
+            self.wait_for_worker_shutdown(Duration::from_millis(500))?;
         } else {
             self.reclaim_stopped_worker();
         }
@@ -322,8 +336,11 @@ impl Backend for ButtplugBackend {
         let (lookup, actuator_index) = match parse_device_id(&device_id) {
             Ok(parsed) => parsed,
             Err(err) => {
-                self.dropped_invalid_device.fetch_add(1, Ordering::SeqCst);
-                eprintln!("buttplug backend: {err}");
+                let dropped_invalid_device =
+                    self.dropped_invalid_device.fetch_add(1, Ordering::SeqCst) + 1;
+                eprintln!(
+                    "buttplug backend: {err} (dropped_invalid_device={dropped_invalid_device})"
+                );
                 return;
             }
         };
@@ -339,14 +356,18 @@ impl Backend for ButtplugBackend {
             WorkerState::Running { tx, .. } => Some(tx),
             WorkerState::Stopped | WorkerState::Stopping { .. } => None,
         }) else {
-            self.dropped_unstarted.fetch_add(1, Ordering::SeqCst);
-            eprintln!("buttplug backend: dropped event because backend is not started");
+            let dropped_unstarted = self.dropped_unstarted.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!(
+                "buttplug backend: dropped event because backend is not started (device_id='{device_id}', dropped_unstarted={dropped_unstarted})"
+            );
             return;
         };
 
         if let Err(err) = sender.try_send(job) {
-            self.dropped_full.fetch_add(1, Ordering::SeqCst);
-            eprintln!("buttplug backend: failed to queue event for '{device_id}': {err}");
+            let dropped_full = self.dropped_full.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!(
+                "buttplug backend: failed to queue event for '{device_id}' (dropped_full={dropped_full}): {err}"
+            );
         }
     }
 }
@@ -425,19 +446,9 @@ fn handle_job(device_cache: &Arc<Mutex<DeviceCache>>, job: GestureJob) {
     );
 }
 
-#[cfg(test)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct BackendTelemetry {
-    processed_jobs: usize,
-    dropped_unstarted: usize,
-    dropped_invalid_device: usize,
-    dropped_full: usize,
-}
-
-#[cfg(test)]
 impl ButtplugBackend {
-    fn telemetry(&self) -> BackendTelemetry {
-        BackendTelemetry {
+    pub fn telemetry_snapshot(&self) -> ButtplugTelemetry {
+        ButtplugTelemetry {
             processed_jobs: self.processed_jobs.load(Ordering::SeqCst),
             dropped_unstarted: self.dropped_unstarted.load(Ordering::SeqCst),
             dropped_invalid_device: self.dropped_invalid_device.load(Ordering::SeqCst),
@@ -445,6 +456,12 @@ impl ButtplugBackend {
         }
     }
 
+    #[cfg(test)]
+    fn telemetry(&self) -> ButtplugTelemetry {
+        self.telemetry_snapshot()
+    }
+
+    #[cfg(test)]
     fn install_test_sender(&self, tx: mpsc::Sender<GestureJob>) {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel();
         let worker = std::thread::spawn(|| {});
@@ -469,15 +486,14 @@ fn translate_event(kind: ActuatorKind, event: &Event) -> Option<ButtplugCommand>
         },
         ActuatorKind::Rotate => ButtplugCommand::Rotate {
             speed: magnitude,
-            // Negative magnitudes force counter-clockwise; otherwise device parity chooses direction.
-            clockwise: if event.magnitude.is_sign_negative() {
-                false
-            } else {
-                event.device.is_multiple_of(2)
-            },
+            clockwise: rotate_clockwise_from_event(event),
             duration_ms: event.duration_ms,
         },
     })
+}
+
+fn rotate_clockwise_from_event(event: &Event) -> bool {
+    !event.magnitude.is_sign_negative() && event.device.is_multiple_of(2)
 }
 
 fn parse_device_id(device_id: &str) -> Result<(DeviceLookup, Option<u32>)> {
@@ -616,11 +632,38 @@ mod tests {
     use std::sync::{Arc, mpsc as std_mpsc};
     use std::time::Duration;
 
+    fn install_running_worker(
+        backend: &ButtplugBackend,
+        tx: mpsc::Sender<GestureJob>,
+        worker: std::thread::JoinHandle<()>,
+    ) {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        *backend.state.lock().unwrap() = WorkerState::Running {
+            tx,
+            shutdown_tx,
+            worker,
+        };
+    }
+
     #[test]
     fn startup_and_teardown_are_safe_before_connection() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         assert!(backend.startup().is_ok());
         assert!(backend.teardown().is_ok());
+    }
+
+    #[test]
+    fn teardown_returns_an_error_when_shutdown_times_out() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let worker = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(700));
+        });
+        install_running_worker(&backend, tx, worker);
+
+        let err = backend.teardown().unwrap_err().to_string();
+        assert!(err.contains("shutdown"));
+        assert!(err.contains("timed out"));
     }
 
     #[test]
@@ -934,6 +977,18 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_snapshot_reports_runtime_drop_counts() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        backend.send_event("broken%2".to_string(), &Event::new(50, 1.0, 0));
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        let telemetry = backend.telemetry_snapshot();
+        assert_eq!(telemetry.dropped_invalid_device, 1);
+        assert_eq!(telemetry.dropped_unstarted, 1);
+        assert_eq!(telemetry.dropped_full, 0);
+    }
+
+    #[test]
     fn startup_failure_does_not_leave_backend_half_initialized() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
@@ -959,5 +1014,16 @@ mod tests {
 
         assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
         backend.teardown().unwrap();
+    }
+
+    #[test]
+    fn rotate_direction_is_even_slot_clockwise_and_negative_overrides() {
+        let positive_even = Event::new(80, 0.75, 0);
+        let positive_odd = Event::new(80, 0.75, 1);
+        let negative_even = Event::new(80, -0.75, 0);
+
+        assert!(rotate_clockwise_from_event(&positive_even));
+        assert!(!rotate_clockwise_from_event(&positive_odd));
+        assert!(!rotate_clockwise_from_event(&negative_even));
     }
 }
