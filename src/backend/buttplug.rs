@@ -3,6 +3,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use tokio::sync::{mpsc, oneshot};
@@ -62,12 +63,28 @@ struct DeviceInfo {
 
 type DeviceCache = HashMap<DeviceLookup, Arc<DeviceInfo>>;
 
+#[derive(Debug, Default)]
+enum WorkerState {
+    #[default]
+    Stopped,
+    Running {
+        tx: mpsc::Sender<GestureJob>,
+        shutdown_tx: oneshot::Sender<()>,
+        worker: std::thread::JoinHandle<()>,
+    },
+    Stopping {
+        worker: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
 pub struct ButtplugBackend {
     pub config: ButtplugConfig,
     device_cache: Arc<Mutex<DeviceCache>>,
-    tx: Mutex<Option<mpsc::Sender<GestureJob>>>,
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    state: Mutex<WorkerState>,
     processed_jobs: Arc<AtomicUsize>,
+    dropped_unstarted: AtomicUsize,
+    dropped_invalid_device: AtomicUsize,
+    dropped_full: AtomicUsize,
 }
 
 impl ButtplugBackend {
@@ -75,9 +92,11 @@ impl ButtplugBackend {
         Self {
             config,
             device_cache: Arc::new(Mutex::new(HashMap::new())),
-            tx: Mutex::new(None),
-            shutdown_tx: Mutex::new(None),
+            state: Mutex::new(WorkerState::Stopped),
             processed_jobs: Arc::new(AtomicUsize::new(0)),
+            dropped_unstarted: AtomicUsize::new(0),
+            dropped_invalid_device: AtomicUsize::new(0),
+            dropped_full: AtomicUsize::new(0),
         }
     }
 
@@ -85,8 +104,15 @@ impl ButtplugBackend {
     where
         F: FnOnce() -> Result<tokio::runtime::Runtime>,
     {
-        if self.tx.lock().unwrap().is_some() {
-            return Ok(());
+        self.reclaim_stopped_worker();
+
+        let mut state = self.state.lock().unwrap();
+        match &*state {
+            WorkerState::Running { .. } => return Ok(()),
+            WorkerState::Stopping { .. } => {
+                bail!("buttplug backend: shutdown still in progress");
+            }
+            WorkerState::Stopped => {}
         }
 
         let runtime = build_runtime()?;
@@ -95,16 +121,57 @@ impl ButtplugBackend {
 
         let device_cache = Arc::clone(&self.device_cache);
         let processed_jobs = Arc::clone(&self.processed_jobs);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("buttplug-backend".to_string())
             .spawn(move || {
                 runtime.block_on(run_worker(rx, shutdown_rx, device_cache, processed_jobs));
             })?;
 
-        *self.tx.lock().unwrap() = Some(tx);
-        *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+        *state = WorkerState::Running {
+            tx,
+            shutdown_tx,
+            worker,
+        };
 
         Ok(())
+    }
+
+    fn reclaim_stopped_worker(&self) {
+        let worker = {
+            let mut state = self.state.lock().unwrap();
+            match &mut *state {
+                WorkerState::Stopping { worker }
+                    if worker.as_ref().is_some_and(|worker| worker.is_finished()) =>
+                {
+                    let worker = worker.take().unwrap();
+                    *state = WorkerState::Stopped;
+                    Some(worker)
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+
+    fn wait_for_worker_shutdown(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            self.reclaim_stopped_worker();
+
+            if matches!(*self.state.lock().unwrap(), WorkerState::Stopped) {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                return;
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[cfg(test)]
@@ -133,19 +200,42 @@ impl ButtplugBackend {
 impl Backend for ButtplugBackend {
     fn startup(&self) -> Result<()> {
         self.startup_with_runtime(|| {
-            Ok(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?,
-            )
+            Ok(tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?)
         })
     }
 
     fn teardown(&self) -> Result<()> {
-        self.tx.lock().unwrap().take();
-        if let Some(shutdown_tx) = self.shutdown_tx.lock().unwrap().take() {
-            let _ = shutdown_tx.send(());
+        let shutdown_requested = {
+            let mut state = self.state.lock().unwrap();
+            match std::mem::replace(&mut *state, WorkerState::Stopped) {
+                WorkerState::Running {
+                    tx,
+                    shutdown_tx,
+                    worker,
+                } => {
+                    drop(tx);
+                    let _ = shutdown_tx.send(());
+                    *state = WorkerState::Stopping {
+                        worker: Some(worker),
+                    };
+                    true
+                }
+                WorkerState::Stopping { worker } => {
+                    *state = WorkerState::Stopping { worker };
+                    false
+                }
+                WorkerState::Stopped => false,
+            }
+        };
+
+        if shutdown_requested {
+            self.wait_for_worker_shutdown(Duration::from_millis(500));
+        } else {
+            self.reclaim_stopped_worker();
         }
+
         Ok(())
     }
 
@@ -172,16 +262,16 @@ impl Backend for ButtplugBackend {
         for (_, lookup, actuator) in &parsed {
             if let Some(actuator) = actuator
                 && let Some(device) = cache.get(lookup)
-            {
-                let reservations = selected.entry(lookup.clone()).or_default();
-                for device_actuator in device
+                && let Some(device_actuator) = device
                     .actuators
                     .iter()
                     .copied()
-                    .filter(|device_actuator| device_actuator.index == *actuator)
-                {
-                    reservations.insert(device_actuator);
-                }
+                    .find(|device_actuator| device_actuator.index == *actuator)
+            {
+                selected
+                    .entry(lookup.clone())
+                    .or_default()
+                    .insert(device_actuator);
             }
         }
 
@@ -212,7 +302,7 @@ impl Backend for ButtplugBackend {
                 None => {
                     let chosen = choose_actuator(
                         &device.actuators,
-                        selected.entry(lookup.clone()).or_default(),
+                        Some(selected.entry(lookup.clone()).or_default()),
                     );
                     debug_assert!(
                         chosen.is_some(),
@@ -232,6 +322,7 @@ impl Backend for ButtplugBackend {
         let (lookup, actuator_index) = match parse_device_id(&device_id) {
             Ok(parsed) => parsed,
             Err(err) => {
+                self.dropped_invalid_device.fetch_add(1, Ordering::SeqCst);
                 eprintln!("buttplug backend: {err}");
                 return;
             }
@@ -243,12 +334,18 @@ impl Backend for ButtplugBackend {
             event: *event,
         };
 
-        let Some(sender) = self.tx.lock().unwrap().as_ref().cloned() else {
+        let state = self.state.lock().unwrap();
+        let Some(sender) = (match &*state {
+            WorkerState::Running { tx, .. } => Some(tx),
+            WorkerState::Stopped | WorkerState::Stopping { .. } => None,
+        }) else {
+            self.dropped_unstarted.fetch_add(1, Ordering::SeqCst);
             eprintln!("buttplug backend: dropped event because backend is not started");
             return;
         };
 
         if let Err(err) = sender.try_send(job) {
+            self.dropped_full.fetch_add(1, Ordering::SeqCst);
             eprintln!("buttplug backend: failed to queue event for '{device_id}': {err}");
         }
     }
@@ -260,11 +357,24 @@ async fn run_worker(
     device_cache: Arc<Mutex<DeviceCache>>,
     processed_jobs: Arc<AtomicUsize>,
 ) {
+    let mut shutdown_requested = false;
     loop {
+        if shutdown_requested {
+            match rx.try_recv() {
+                Ok(job) => {
+                    processed_jobs.fetch_add(1, Ordering::SeqCst);
+                    handle_job(&device_cache, job);
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
         tokio::select! {
             _ = &mut shutdown_rx => {
                 eprintln!("buttplug backend: shutdown requested");
-                break;
+                shutdown_requested = true;
             }
             maybe_job = rx.recv() => {
                 let Some(job) = maybe_job else {
@@ -284,14 +394,13 @@ fn handle_job(device_cache: &Arc<Mutex<DeviceCache>>, job: GestureJob) {
         return;
     };
 
-    let selected = HashSet::new();
     let actuator = match job.actuator_index {
         Some(index) => device
             .actuators
             .iter()
             .copied()
             .find(|actuator| actuator.index == index),
-        None => choose_actuator(&device.actuators, &selected),
+        None => choose_actuator(&device.actuators, None),
     };
 
     let Some(actuator) = actuator else {
@@ -316,8 +425,39 @@ fn handle_job(device_cache: &Arc<Mutex<DeviceCache>>, job: GestureJob) {
     );
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BackendTelemetry {
+    processed_jobs: usize,
+    dropped_unstarted: usize,
+    dropped_invalid_device: usize,
+    dropped_full: usize,
+}
+
+#[cfg(test)]
+impl ButtplugBackend {
+    fn telemetry(&self) -> BackendTelemetry {
+        BackendTelemetry {
+            processed_jobs: self.processed_jobs.load(Ordering::SeqCst),
+            dropped_unstarted: self.dropped_unstarted.load(Ordering::SeqCst),
+            dropped_invalid_device: self.dropped_invalid_device.load(Ordering::SeqCst),
+            dropped_full: self.dropped_full.load(Ordering::SeqCst),
+        }
+    }
+
+    fn install_test_sender(&self, tx: mpsc::Sender<GestureJob>) {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let worker = std::thread::spawn(|| {});
+        *self.state.lock().unwrap() = WorkerState::Running {
+            tx,
+            shutdown_tx,
+            worker,
+        };
+    }
+}
+
 fn translate_event(kind: ActuatorKind, event: &Event) -> Option<ButtplugCommand> {
-    let magnitude = event.magnitude.clamp(0.0, 1.0);
+    let magnitude = event.magnitude.abs().clamp(0.0, 1.0);
     Some(match kind {
         ActuatorKind::Vibrate => ButtplugCommand::Vibrate {
             magnitude,
@@ -329,7 +469,12 @@ fn translate_event(kind: ActuatorKind, event: &Event) -> Option<ButtplugCommand>
         },
         ActuatorKind::Rotate => ButtplugCommand::Rotate {
             speed: magnitude,
-            clockwise: true,
+            // Negative magnitudes force counter-clockwise; otherwise device parity chooses direction.
+            clockwise: if event.magnitude.is_sign_negative() {
+                false
+            } else {
+                event.device.is_multiple_of(2)
+            },
             duration_ms: event.duration_ms,
         },
     })
@@ -373,13 +518,17 @@ fn format_device_id(lookup: &DeviceLookup, actuator: Option<u32>) -> String {
     }
 }
 
-fn choose_actuator(actuators: &[Actuator], selected: &HashSet<Actuator>) -> Option<Actuator> {
+fn choose_actuator(
+    actuators: &[Actuator],
+    selected: Option<&HashSet<Actuator>>,
+) -> Option<Actuator> {
     let mut actuators = actuators.to_vec();
     actuators.sort_by_key(|actuator| (actuator.kind, actuator.index));
 
-    if let Some(actuator) = actuators
-        .iter()
-        .find(|actuator| !selected.contains(actuator))
+    if let Some(selected) = selected
+        && let Some(actuator) = actuators
+            .iter()
+            .find(|actuator| !selected.contains(actuator))
     {
         return Some(*actuator);
     }
@@ -464,6 +613,7 @@ fn hex_digit(value: u8) -> char {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, mpsc as std_mpsc};
     use std::time::Duration;
 
     #[test]
@@ -643,6 +793,69 @@ mod tests {
     }
 
     #[test]
+    fn startup_is_atomic_under_concurrent_calls() {
+        let backend = Arc::new(ButtplugBackend::new(ButtplugConfig::default()));
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let builder_calls = Arc::new(AtomicUsize::new(0));
+
+        let first_backend = Arc::clone(&backend);
+        let first_calls = Arc::clone(&builder_calls);
+        let first = std::thread::spawn(move || {
+            first_backend.startup_with_runtime(move || {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                release_rx
+                    .recv()
+                    .expect("release signal should arrive before startup exits");
+                Ok(tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?)
+            })
+        });
+
+        while builder_calls.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let second_backend = Arc::clone(&backend);
+        let second = std::thread::spawn(move || {
+            second_backend.startup_with_runtime(|| {
+                Err(anyhow::anyhow!("second startup should not build a runtime"))
+            })
+        });
+
+        release_tx.send(()).unwrap();
+
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.join().unwrap().is_ok());
+        assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
+
+        backend.teardown().unwrap();
+    }
+
+    #[test]
+    fn translate_rotate_event_uses_direction_mapping() {
+        let event = Event::new(80, 0.75, 1);
+        assert_eq!(
+            translate_event(ActuatorKind::Rotate, &event),
+            Some(ButtplugCommand::Rotate {
+                speed: 0.75,
+                clockwise: false,
+                duration_ms: 80,
+            })
+        );
+
+        let event = Event::new(80, -0.75, 0);
+        assert_eq!(
+            translate_event(ActuatorKind::Rotate, &event),
+            Some(ButtplugCommand::Rotate {
+                speed: 0.75,
+                clockwise: false,
+                duration_ms: 80,
+            })
+        );
+    }
+
+    #[test]
     fn translate_linear_event_into_linear_command() {
         let event = Event::new(80, 0.75, 0);
         assert_eq!(
@@ -672,22 +885,52 @@ mod tests {
         backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
 
         backend.startup().unwrap();
-        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.telemetry().processed_jobs, 0);
 
-        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+        for _ in 0..16 {
+            backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+        }
 
         for _ in 0..100 {
-            if backend.processed_jobs.load(Ordering::SeqCst) == 1 {
+            if backend.telemetry().processed_jobs == 16 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.telemetry().processed_jobs, 16);
 
         backend.teardown().unwrap();
         backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.telemetry().processed_jobs, 16);
+    }
+
+    #[test]
+    fn send_event_records_dropped_conditions() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        backend.send_event("broken%2".to_string(), &Event::new(50, 1.0, 0));
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        let telemetry = backend.telemetry();
+        assert_eq!(telemetry.dropped_invalid_device, 1);
+        assert_eq!(telemetry.dropped_unstarted, 1);
+        assert_eq!(telemetry.dropped_full, 0);
+    }
+
+    #[test]
+    fn send_event_records_queue_full() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+        backend.install_test_sender(tx);
+
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        let telemetry = backend.telemetry();
+        assert_eq!(telemetry.dropped_full, 1);
+        assert_eq!(telemetry.dropped_unstarted, 0);
+        assert_eq!(telemetry.dropped_invalid_device, 0);
+        backend.teardown().unwrap();
     }
 
     #[test]
@@ -699,8 +942,10 @@ mod tests {
             .startup_with_runtime(|| Err(anyhow::anyhow!("runtime build failed")))
             .unwrap_err();
         assert!(err.to_string().contains("runtime build failed"));
-        assert!(backend.tx.lock().unwrap().is_none());
-        assert!(backend.shutdown_tx.lock().unwrap().is_none());
+        assert!(matches!(
+            *backend.state.lock().unwrap(),
+            WorkerState::Stopped
+        ));
 
         backend.startup().unwrap();
         backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
