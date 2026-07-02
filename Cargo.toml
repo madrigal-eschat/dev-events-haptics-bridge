@@ -10,12 +10,20 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.7"
+buttplug_client = "10"
+buttplug_core = "10"
+buttplug_transport_websocket_tungstenite = "10"
+env_logger = "0.11"
+futures = "0.3"
+log = "0.4"
 rumqttc = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+strum = "0.26"
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.24"
