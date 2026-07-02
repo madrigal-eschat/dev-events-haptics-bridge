@@ -103,6 +103,10 @@ impl Backend for HttpBackend {
         Ok(DeviceList::List(vec![VALID_DEVICE_ID.to_string()]))
     }
 
+    fn resolve_device_ids(&self, device_ids: &[String]) -> Result<Vec<String>> {
+        Ok(device_ids.to_vec())
+    }
+
     fn send_event(&self, device_id: String, event: &Event) {
         let mut events = self.events.lock().unwrap();
         events.push_back(format!("{device_id} {event:?}"));
@@ -140,6 +144,13 @@ mod tests {
             DeviceList::List(ids) => assert_eq!(ids, vec!["0".to_string()]),
             DeviceList::Anything => panic!("expected List, got Anything"),
         }
+    }
+
+    #[test]
+    fn resolve_device_ids_is_identity() {
+        let backend = HttpBackend::new("127.0.0.1:0".to_string());
+        let ids = vec!["0".to_string(), "1".to_string()];
+        assert_eq!(backend.resolve_device_ids(&ids).unwrap(), ids);
     }
 
     #[test]
