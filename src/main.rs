@@ -119,15 +119,36 @@ fn dispatch_rule(
     devices: &[String],
     events: &[gestures::Event],
 ) -> Result<()> {
-    let backend_name = devices
-        .first()
-        .and_then(|addr| addr.split_once('/'))
-        .expect("validated at startup")
-        .0;
-    let resolved_devices = backends[backend_name].resolve_device_ids(devices)?;
+    let first_device = devices.first().context("rule has empty device list")?;
+    let (backend_name, _) = first_device
+        .split_once('/')
+        .with_context(|| format!("invalid device address '{first_device}'"))?;
+
+    for addr in devices.iter().skip(1) {
+        let (device_backend, _) = addr
+            .split_once('/')
+            .with_context(|| format!("invalid device address '{addr}'"))?;
+        if device_backend != backend_name {
+            anyhow::bail!(
+                "rule mixes backends: '{backend_name}' and '{device_backend}' in devices {devices:?}"
+            );
+        }
+    }
+
+    let backend = backends
+        .get(backend_name)
+        .with_context(|| format!("backend '{backend_name}' not initialized"))?;
+    let resolved_devices = backend.resolve_device_ids(devices)?;
     for haptic_event in events {
-        let device_id = &resolved_devices[haptic_event.device as usize];
-        backends[backend_name].send_event(device_id.to_string(), haptic_event);
+        let device_index = haptic_event.device as usize;
+        let device_id = resolved_devices.get(device_index).with_context(|| {
+            format!(
+                "backend '{backend_name}' resolved {} device id(s), but gesture referenced device index {}",
+                resolved_devices.len(),
+                device_index
+            )
+        })?;
+        backend.send_event(device_id.to_string(), haptic_event);
     }
     Ok(())
 }
@@ -148,8 +169,9 @@ mod tests {
     #[derive(Clone, Copy, Default)]
     enum ResolveMode {
         #[default]
-        PreservePrefix,
-        StripPrefix,
+        Identity,
+        BackendLocal,
+        TooShort,
     }
 
     impl backend::Backend for RecordingBackend {
@@ -172,16 +194,13 @@ mod tests {
         fn resolve_device_ids(&self, device_ids: &[String]) -> anyhow::Result<Vec<String>> {
             self.resolve_calls.lock().unwrap().push(device_ids.to_vec());
             Ok(match self.resolve_mode {
-                ResolveMode::PreservePrefix => device_ids.to_vec(),
-                ResolveMode::StripPrefix => device_ids
-                    .iter()
-                    .map(|device_id| {
-                        device_id
-                            .split_once('/')
-                            .map(|(_, id)| id.to_string())
-                            .unwrap_or_else(|| device_id.clone())
-                    })
-                    .collect(),
+                ResolveMode::Identity => device_ids.to_vec(),
+                ResolveMode::BackendLocal => vec![
+                    "0".to_string(),
+                    "0/1".to_string(),
+                    "Lovense%2FNora/1".to_string(),
+                ],
+                ResolveMode::TooShort => vec!["0".to_string()],
             })
         }
 
@@ -191,17 +210,25 @@ mod tests {
     }
 
     #[test]
-    fn rule_device_ids_with_backend_prefix_are_preserved_end_to_end() {
-        let backend = RecordingBackend::default();
+    fn rule_device_ids_without_backend_prefix_still_use_original_backend() {
+        let backend = RecordingBackend {
+            resolve_mode: ResolveMode::BackendLocal,
+            ..Default::default()
+        };
         let handle = backend.clone();
 
         let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
-        backends.insert("stdout".to_string(), Box::new(backend));
+        backends.insert("buttplug".to_string(), Box::new(backend));
 
-        let devices = vec!["stdout/0".to_string(), "stdout/1".to_string()];
+        let devices = vec![
+            "buttplug/0".to_string(),
+            "buttplug/1".to_string(),
+            "buttplug/2".to_string(),
+        ];
         let events = vec![
             gestures::Event::new(50, 1.0, 0),
             gestures::Event::new(50, 1.0, 1),
+            gestures::Event::new(50, 1.0, 2),
         ];
 
         dispatch_rule(&backends, &devices, &events).unwrap();
@@ -209,14 +236,37 @@ mod tests {
         assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
         assert_eq!(
             handle.sent_device_ids.lock().unwrap().as_slice(),
-            &["stdout/0".to_string(), "stdout/1".to_string()]
+            &[
+                "0".to_string(),
+                "0/1".to_string(),
+                "Lovense%2FNora/1".to_string()
+            ]
         );
     }
 
     #[test]
-    fn rule_device_ids_without_backend_prefix_still_use_original_backend() {
+    fn rule_device_ids_must_share_a_backend() {
+        let backend = RecordingBackend::default();
+        let handle = backend.clone();
+
+        let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
+        backends.insert("buttplug".to_string(), Box::new(backend));
+        backends.insert("stdout".to_string(), Box::new(backend::StdoutBackend));
+
+        let devices = vec!["buttplug/0".to_string(), "stdout/1".to_string()];
+        let events = vec![gestures::Event::new(50, 1.0, 0)];
+
+        let err = dispatch_rule(&backends, &devices, &events)
+            .err()
+            .expect("expected mixed-backend error");
+        assert!(err.to_string().contains("mixes backends"), "{err}");
+        assert!(handle.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolved_device_ids_are_bounds_checked() {
         let backend = RecordingBackend {
-            resolve_mode: ResolveMode::StripPrefix,
+            resolve_mode: ResolveMode::TooShort,
             ..Default::default()
         };
         let handle = backend.clone();
@@ -225,17 +275,12 @@ mod tests {
         backends.insert("buttplug".to_string(), Box::new(backend));
 
         let devices = vec!["buttplug/0".to_string(), "buttplug/1".to_string()];
-        let events = vec![
-            gestures::Event::new(50, 1.0, 0),
-            gestures::Event::new(50, 1.0, 1),
-        ];
+        let events = vec![gestures::Event::new(50, 1.0, 1)];
 
-        dispatch_rule(&backends, &devices, &events).unwrap();
-
+        let err = dispatch_rule(&backends, &devices, &events)
+            .err()
+            .expect("expected bounds error");
+        assert!(err.to_string().contains("device index 1"), "{err}");
         assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
-        assert_eq!(
-            handle.sent_device_ids.lock().unwrap().as_slice(),
-            &["0".to_string(), "1".to_string()]
-        );
     }
 }
