@@ -925,6 +925,7 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buttplug_core::message::OutputCommand;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc as std_mpsc};
     use std::time::Duration;
@@ -1407,6 +1408,105 @@ mod tests {
         let telemetry = backend.telemetry_snapshot();
         assert_eq!(telemetry.dropped_disconnected, 0);
         assert_eq!(telemetry.dropped_unknown_device, 0);
+    }
+
+    #[tokio::test]
+    async fn connects_discovers_and_dispatches_to_mock_server() {
+        let mut server = buttplug_mock_server::start().await;
+        let config = ButtplugConfig {
+            server: format!("ws://{}", server.addr),
+            connection_timeout_ms: 2_000,
+            max_backoff_ms: 1_000,
+            scan_interval_ms: 60_000,
+        };
+        let backend = ButtplugBackend::new(config);
+        backend.startup().unwrap();
+
+        // Device discovery happens asynchronously after connect; poll briefly.
+        let mut resolved = None;
+        for _ in 0..100 {
+            let ids = backend.resolve_device_ids(&["0".to_string()]);
+            if let Ok(ids) = ids
+                && ids.first().is_some_and(|id| id != "0")
+            {
+                resolved = Some(ids);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            resolved.is_some(),
+            "expected device '0' to resolve to a real actuator id once discovered"
+        );
+
+        backend.send_event(resolved.unwrap()[0].clone(), &Event::new(50, 0.8, 0));
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server.output_cmds.recv())
+            .await
+            .expect("mock server should receive an OutputCmd within 2s")
+            .expect("output_cmds channel should not close");
+        match received {
+            OutputCommand::Vibrate(value) => {
+                assert!(value.value() > 0, "expected a nonzero vibrate value");
+            }
+            other => panic!("expected Vibrate output command, got {other:?}"),
+        }
+
+        backend.teardown().unwrap();
+        server.stop();
+    }
+
+    #[tokio::test]
+    async fn reconnects_with_backoff_after_server_restart() {
+        let server = buttplug_mock_server::start().await;
+        let addr = server.addr;
+        let config = ButtplugConfig {
+            server: format!("ws://{addr}"),
+            connection_timeout_ms: 500,
+            max_backoff_ms: 300,
+            scan_interval_ms: 60_000,
+        };
+        let backend = ButtplugBackend::new(config);
+        backend.startup().unwrap();
+
+        // Wait for the first connection to establish (device resolves).
+        let mut first_resolved = false;
+        for _ in 0..100 {
+            if let Ok(ids) = backend.resolve_device_ids(&["0".to_string()])
+                && ids.first().is_some_and(|id| id != "0")
+            {
+                first_resolved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            first_resolved,
+            "expected initial connection to discover the device"
+        );
+
+        // Kill the server, wait past a backoff cycle, then bring it back on the same port.
+        server.stop();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _second_server = buttplug_mock_server::start_on(addr).await;
+
+        // The connection manager should reconnect and rediscover the device on its own.
+        let mut reconnected = false;
+        for _ in 0..150 {
+            if let Ok(ids) = backend.resolve_device_ids(&["0".to_string()])
+                && ids.first().is_some_and(|id| id != "0")
+            {
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reconnected,
+            "expected reconnection to rediscover the device after restart"
+        );
+
+        backend.teardown().unwrap();
     }
 }
 
