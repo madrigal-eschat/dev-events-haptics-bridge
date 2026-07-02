@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use buttplug_core::message::OutputType;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{Backend, DeviceList};
@@ -18,7 +19,6 @@ pub enum DeviceLookup {
     ByName(String),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 enum ActuatorKind {
     Vibrate,
@@ -472,6 +472,18 @@ impl ButtplugBackend {
             shutdown_tx,
             worker,
         };
+    }
+}
+
+fn classify_output_types(outputs: &[OutputType]) -> Option<ActuatorKind> {
+    if outputs.contains(&OutputType::Vibrate) {
+        Some(ActuatorKind::Vibrate)
+    } else if outputs.contains(&OutputType::HwPositionWithDuration) {
+        Some(ActuatorKind::Linear)
+    } else if outputs.contains(&OutputType::Rotate) {
+        Some(ActuatorKind::Rotate)
+    } else {
+        None
     }
 }
 
@@ -1018,6 +1030,39 @@ mod tests {
 
         assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
         backend.teardown().unwrap();
+    }
+
+    #[test]
+    fn classify_output_types_prefers_vibrate() {
+        assert_eq!(
+            classify_output_types(&[OutputType::Vibrate, OutputType::Rotate]),
+            Some(ActuatorKind::Vibrate)
+        );
+    }
+
+    #[test]
+    fn classify_output_types_falls_back_to_linear_then_rotate() {
+        assert_eq!(
+            classify_output_types(&[OutputType::HwPositionWithDuration]),
+            Some(ActuatorKind::Linear)
+        );
+        assert_eq!(
+            classify_output_types(&[OutputType::Rotate]),
+            Some(ActuatorKind::Rotate)
+        );
+        assert_eq!(
+            classify_output_types(&[OutputType::HwPositionWithDuration, OutputType::Rotate]),
+            Some(ActuatorKind::Linear)
+        );
+    }
+
+    #[test]
+    fn classify_output_types_excludes_unsupported_outputs() {
+        assert_eq!(
+            classify_output_types(&[OutputType::Led, OutputType::Constrict]),
+            None
+        );
+        assert_eq!(classify_output_types(&[]), None);
     }
 
 }
