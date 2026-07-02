@@ -1409,3 +1409,7 @@ mod tests {
         assert_eq!(telemetry.dropped_unknown_device, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "buttplug_mock_server.rs"]
+mod buttplug_mock_server;
