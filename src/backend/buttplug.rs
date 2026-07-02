@@ -38,6 +38,8 @@ pub struct ButtplugTelemetry {
     dropped_unstarted: usize,
     dropped_invalid_device: usize,
     dropped_full: usize,
+    dropped_disconnected: usize,
+    dropped_unknown_device: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,8 @@ pub struct ButtplugBackend {
     dropped_unstarted: AtomicUsize,
     dropped_invalid_device: AtomicUsize,
     dropped_full: AtomicUsize,
+    dropped_disconnected: Arc<AtomicUsize>,
+    dropped_unknown_device: Arc<AtomicUsize>,
 }
 
 impl ButtplugBackend {
@@ -96,6 +100,8 @@ impl ButtplugBackend {
             dropped_unstarted: AtomicUsize::new(0),
             dropped_invalid_device: AtomicUsize::new(0),
             dropped_full: AtomicUsize::new(0),
+            dropped_disconnected: Arc::new(AtomicUsize::new(0)),
+            dropped_unknown_device: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -455,6 +461,8 @@ impl ButtplugBackend {
             dropped_unstarted: self.dropped_unstarted.load(Ordering::SeqCst),
             dropped_invalid_device: self.dropped_invalid_device.load(Ordering::SeqCst),
             dropped_full: self.dropped_full.load(Ordering::SeqCst),
+            dropped_disconnected: self.dropped_disconnected.load(Ordering::SeqCst),
+            dropped_unknown_device: self.dropped_unknown_device.load(Ordering::SeqCst),
         }
     }
 
@@ -1127,6 +1135,14 @@ mod tests {
         let mut backoff = Backoff::new(500);
         assert_eq!(backoff.next(), Duration::from_millis(500));
         assert_eq!(backoff.next(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn telemetry_snapshot_starts_at_zero_for_new_counters() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let telemetry = backend.telemetry_snapshot();
+        assert_eq!(telemetry.dropped_disconnected, 0);
+        assert_eq!(telemetry.dropped_unknown_device, 0);
     }
 
 }
