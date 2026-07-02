@@ -248,6 +248,9 @@ impl Backend for ButtplugBackend {
             self.wait_for_worker_shutdown(Duration::from_millis(500))?;
         } else {
             self.reclaim_stopped_worker();
+            if matches!(*self.state.lock().unwrap(), WorkerState::Stopping { .. }) {
+                bail!("buttplug backend: shutdown still in progress");
+            }
         }
 
         Ok(())
@@ -664,6 +667,26 @@ mod tests {
         let err = backend.teardown().unwrap_err().to_string();
         assert!(err.contains("shutdown"));
         assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn repeated_teardown_keeps_failing_until_worker_stops() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let (tx, _rx) = mpsc::channel(1);
+        let worker = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(700));
+        });
+        install_running_worker(&backend, tx, worker);
+
+        let err = backend.teardown().unwrap_err().to_string();
+        assert!(err.contains("shutdown"));
+        assert!(err.contains("timed out"));
+
+        let err = backend.teardown().unwrap_err().to_string();
+        assert!(err.contains("shutdown still in progress"));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(backend.teardown().is_ok());
     }
 
     #[test]
