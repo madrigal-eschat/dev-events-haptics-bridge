@@ -97,21 +97,20 @@ impl Backend for ButtplugBackend {
             .collect::<Result<_>>()?;
 
         let cache = self.device_cache.lock().unwrap();
-        let mut selected: HashMap<usize, HashSet<Actuator>> = HashMap::new();
+        let mut selected: HashMap<DeviceLookup, HashSet<Actuator>> = HashMap::new();
 
         for (_, lookup, actuator) in &parsed {
-            if let Some(actuator) = actuator {
-                if let Some(device) = cache.get(lookup) {
-                    let device_key = Arc::as_ptr(device) as usize;
-                    let reservations = selected.entry(device_key).or_default();
-                    for device_actuator in device
-                        .actuators
-                        .iter()
-                        .copied()
-                        .filter(|device_actuator| device_actuator.index == *actuator)
-                    {
-                        reservations.insert(device_actuator);
-                    }
+            if let Some(actuator) = actuator
+                && let Some(device) = cache.get(lookup)
+            {
+                let reservations = selected.entry(lookup.clone()).or_default();
+                for device_actuator in device
+                    .actuators
+                    .iter()
+                    .copied()
+                    .filter(|device_actuator| device_actuator.index == *actuator)
+                {
+                    reservations.insert(device_actuator);
                 }
             }
         }
@@ -123,11 +122,7 @@ impl Backend for ButtplugBackend {
                 continue;
             };
 
-            let device_key = Arc::as_ptr(device) as usize;
             if device.actuators.is_empty() {
-                if actuator.is_some() {
-                    bail!("unknown actuator in device id '{raw}'");
-                }
                 resolved.push(raw);
                 continue;
             }
@@ -139,18 +134,21 @@ impl Backend for ButtplugBackend {
                         .iter()
                         .any(|device_actuator| device_actuator.index == actuator)
                     {
-                        bail!("unknown actuator in device id '{raw}'");
+                        resolved.push(raw);
+                        continue;
                     }
                     resolved.push(format_device_id(&lookup, Some(actuator)));
                 }
                 None => {
-                    let chosen =
-                        choose_actuator(&device.actuators, selected.entry(device_key).or_default());
+                    let chosen = choose_actuator(
+                        &device.actuators,
+                        selected.entry(lookup.clone()).or_default(),
+                    );
                     let Some(chosen) = chosen else {
                         resolved.push(raw);
                         continue;
                     };
-                    selected.get_mut(&device_key).unwrap().insert(chosen);
+                    selected.get_mut(&lookup).unwrap().insert(chosen);
                     resolved.push(format_device_id(&lookup, Some(chosen.index)));
                 }
             }
@@ -330,6 +328,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_device_id_round_trips_percent_encoded_slash_in_lookup() {
+        let (lookup, actuator) = parse_device_id("Lovense%2FNora/1").unwrap();
+        assert_eq!(lookup, DeviceLookup::ByName("Lovense/Nora".into()));
+        assert_eq!(actuator, Some(1));
+        assert_eq!(format_device_id(&lookup, actuator), "Lovense%2FNora/1");
+    }
+
+    #[test]
     fn parse_device_id_classifies_numeric_lookups_as_indices() {
         let (lookup, actuator) = parse_device_id("42").unwrap();
         assert_eq!(lookup, DeviceLookup::ByIndex(42));
@@ -399,32 +405,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_device_ids_rejects_unknown_explicit_actuator_for_known_device() {
+    fn resolve_device_ids_leaves_unknown_explicit_actuator_unresolved() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(
             DeviceLookup::ByIndex(7),
             vec![ActuatorKind::Vibrate, ActuatorKind::Linear],
         );
 
-        let err = backend
-            .resolve_device_ids(&["7/9".to_string()])
-            .unwrap_err();
-        assert!(err.to_string().contains("7/9"), "{err}");
+        let ids = vec!["7/9".to_string()];
+        let resolved = backend.resolve_device_ids(&ids).unwrap();
+
+        assert_eq!(resolved, ids);
     }
 
     #[test]
-    fn resolve_device_ids_rejects_explicit_actuator_on_zero_actuator_device() {
+    fn resolve_device_ids_leaves_explicit_actuator_on_zero_actuator_device_unresolved() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(DeviceLookup::ByIndex(3), vec![]);
 
-        let err = backend
-            .resolve_device_ids(&["3/0".to_string()])
-            .unwrap_err();
-        assert!(err.to_string().contains("3/0"), "{err}");
+        let ids = vec!["3/0".to_string()];
+        let resolved = backend.resolve_device_ids(&ids).unwrap();
+
+        assert_eq!(resolved, ids);
     }
 
     #[test]
-    fn resolve_device_ids_shares_selection_between_index_and_name_aliases() {
+    fn resolve_device_ids_keeps_selection_scoped_to_each_lookup() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device_aliases(
             vec![
@@ -439,7 +445,7 @@ mod tests {
 
         assert_eq!(
             resolved,
-            vec!["7/0".to_string(), "Lovense%20Nora/1".to_string()]
+            vec!["7/0".to_string(), "Lovense%20Nora/0".to_string()]
         );
     }
 }
