@@ -124,10 +124,12 @@ fn dispatch_rule(
         .and_then(|addr| addr.split_once('/'))
         .expect("validated at startup")
         .0;
+    let backend_prefix = format!("{backend_name}/");
     let resolved_devices = backends[backend_name].resolve_device_ids(devices)?;
     for haptic_event in events {
-        let addr = &resolved_devices[haptic_event.device as usize];
-        let (backend_name, device_id) = addr.split_once('/').expect("validated at startup");
+        let device_id = resolved_devices[haptic_event.device as usize]
+            .strip_prefix(&backend_prefix)
+            .unwrap_or(&resolved_devices[haptic_event.device as usize]);
         backends[backend_name].send_event(device_id.to_string(), haptic_event);
     }
     Ok(())
@@ -141,8 +143,16 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingBackend {
+        resolve_mode: ResolveMode,
         resolve_calls: Arc<Mutex<Vec<Vec<String>>>>,
         sent_device_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum ResolveMode {
+        #[default]
+        PreservePrefix,
+        StripPrefix,
     }
 
     impl backend::Backend for RecordingBackend {
@@ -164,10 +174,18 @@ mod tests {
 
         fn resolve_device_ids(&self, device_ids: &[String]) -> anyhow::Result<Vec<String>> {
             self.resolve_calls.lock().unwrap().push(device_ids.to_vec());
-            Ok(device_ids
-                .iter()
-                .map(|device_id| format!("{device_id}/resolved"))
-                .collect())
+            Ok(match self.resolve_mode {
+                ResolveMode::PreservePrefix => device_ids.to_vec(),
+                ResolveMode::StripPrefix => device_ids
+                    .iter()
+                    .map(|device_id| {
+                        device_id
+                            .split_once('/')
+                            .map(|(_, id)| id.to_string())
+                            .unwrap_or_else(|| device_id.clone())
+                    })
+                    .collect(),
+            })
         }
 
         fn send_event(&self, device_id: String, _event: &gestures::Event) {
@@ -176,8 +194,34 @@ mod tests {
     }
 
     #[test]
-    fn rule_device_ids_are_resolved_once_per_firing() {
+    fn rule_device_ids_with_backend_prefix_are_resolved_once_per_firing() {
         let backend = RecordingBackend::default();
+        let handle = backend.clone();
+
+        let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
+        backends.insert("stdout".to_string(), Box::new(backend));
+
+        let devices = vec!["stdout/0".to_string(), "stdout/1".to_string()];
+        let events = vec![
+            gestures::Event::new(50, 1.0, 0),
+            gestures::Event::new(50, 1.0, 1),
+        ];
+
+        dispatch_rule(&backends, &devices, &events).unwrap();
+
+        assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
+        assert_eq!(
+            handle.sent_device_ids.lock().unwrap().as_slice(),
+            &["0".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn rule_device_ids_without_backend_prefix_still_use_original_backend() {
+        let backend = RecordingBackend {
+            resolve_mode: ResolveMode::StripPrefix,
+            ..Default::default()
+        };
         let handle = backend.clone();
 
         let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
@@ -194,7 +238,7 @@ mod tests {
         assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
         assert_eq!(
             handle.sent_device_ids.lock().unwrap().as_slice(),
-            &["0/resolved".to_string(), "1/resolved".to_string()]
+            &["0".to_string(), "1".to_string()]
         );
     }
 }
