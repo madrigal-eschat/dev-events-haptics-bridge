@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Result, bail};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::{Backend, DeviceList};
 use crate::config::ButtplugConfig;
@@ -27,6 +31,30 @@ struct Actuator {
     kind: ActuatorKind,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ButtplugCommand {
+    Vibrate {
+        magnitude: f32,
+        frequency: f32,
+    },
+    Linear {
+        position: f32,
+        duration_ms: u32,
+    },
+    Rotate {
+        speed: f32,
+        clockwise: bool,
+        duration_ms: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct GestureJob {
+    lookup: DeviceLookup,
+    actuator_index: Option<u32>,
+    event: Event,
+}
+
 #[derive(Debug, Clone, Default)]
 struct DeviceInfo {
     actuators: Vec<Actuator>,
@@ -36,14 +64,20 @@ type DeviceCache = HashMap<DeviceLookup, Arc<DeviceInfo>>;
 
 pub struct ButtplugBackend {
     pub config: ButtplugConfig,
-    device_cache: Mutex<DeviceCache>,
+    device_cache: Arc<Mutex<DeviceCache>>,
+    tx: Mutex<Option<mpsc::Sender<GestureJob>>>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    processed_jobs: Arc<AtomicUsize>,
 }
 
 impl ButtplugBackend {
     pub fn new(config: ButtplugConfig) -> Self {
         Self {
             config,
-            device_cache: Mutex::new(HashMap::new()),
+            device_cache: Arc::new(Mutex::new(HashMap::new())),
+            tx: Mutex::new(None),
+            shutdown_tx: Mutex::new(None),
+            processed_jobs: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -72,10 +106,33 @@ impl ButtplugBackend {
 
 impl Backend for ButtplugBackend {
     fn startup(&self) -> Result<()> {
+        if self.tx.lock().unwrap().is_some() {
+            return Ok(());
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        *self.tx.lock().unwrap() = Some(tx);
+        *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+
+        let device_cache = Arc::clone(&self.device_cache);
+        let processed_jobs = Arc::clone(&self.processed_jobs);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        std::thread::spawn(move || {
+            runtime.block_on(run_worker(rx, shutdown_rx, device_cache, processed_jobs));
+        });
+
         Ok(())
     }
 
     fn teardown(&self) -> Result<()> {
+        self.tx.lock().unwrap().take();
+        if let Some(shutdown_tx) = self.shutdown_tx.lock().unwrap().take() {
+            let _ = shutdown_tx.send(());
+        }
         Ok(())
     }
 
@@ -158,7 +215,111 @@ impl Backend for ButtplugBackend {
         Ok(resolved)
     }
 
-    fn send_event(&self, _device_id: String, _event: &Event) {}
+    fn send_event(&self, device_id: String, event: &Event) {
+        let (lookup, actuator_index) = match parse_device_id(&device_id) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("buttplug backend: {err}");
+                return;
+            }
+        };
+
+        let job = GestureJob {
+            lookup,
+            actuator_index,
+            event: *event,
+        };
+
+        let Some(sender) = self.tx.lock().unwrap().as_ref().cloned() else {
+            eprintln!("buttplug backend: dropped event because backend is not started");
+            return;
+        };
+
+        if let Err(err) = sender.try_send(job) {
+            eprintln!("buttplug backend: failed to queue event for '{device_id}': {err}");
+        }
+    }
+}
+
+async fn run_worker(
+    mut rx: mpsc::Receiver<GestureJob>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    device_cache: Arc<Mutex<DeviceCache>>,
+    processed_jobs: Arc<AtomicUsize>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                eprintln!("buttplug backend: shutdown requested");
+                break;
+            }
+            maybe_job = rx.recv() => {
+                let Some(job) = maybe_job else {
+                    break;
+                };
+                processed_jobs.fetch_add(1, Ordering::SeqCst);
+                handle_job(&device_cache, job);
+            }
+        }
+    }
+}
+
+fn handle_job(device_cache: &Arc<Mutex<DeviceCache>>, job: GestureJob) {
+    let cache = device_cache.lock().unwrap();
+    let Some(device) = cache.get(&job.lookup) else {
+        eprintln!("buttplug backend: unknown device lookup {:?}", job.lookup);
+        return;
+    };
+
+    let selected = HashSet::new();
+    let actuator = match job.actuator_index {
+        Some(index) => device
+            .actuators
+            .iter()
+            .copied()
+            .find(|actuator| actuator.index == index),
+        None => choose_actuator(&device.actuators, &selected),
+    };
+
+    let Some(actuator) = actuator else {
+        eprintln!(
+            "buttplug backend: device {:?} has no usable actuators",
+            job.lookup
+        );
+        return;
+    };
+
+    let Some(command) = translate_event(actuator.kind, &job.event) else {
+        eprintln!(
+            "buttplug backend: unsupported actuator kind {:?} for device {:?}",
+            actuator.kind, job.lookup
+        );
+        return;
+    };
+
+    eprintln!(
+        "buttplug backend: dispatch {:?} actuator {} as {:?}",
+        job.lookup, actuator.index, command
+    );
+}
+
+fn translate_event(kind: ActuatorKind, event: &Event) -> Option<ButtplugCommand> {
+    let magnitude = event.magnitude.clamp(0.0, 1.0);
+    Some(match kind {
+        ActuatorKind::Vibrate => ButtplugCommand::Vibrate {
+            magnitude,
+            frequency: magnitude,
+        },
+        ActuatorKind::Linear => ButtplugCommand::Linear {
+            position: magnitude,
+            duration_ms: event.duration_ms,
+        },
+        ActuatorKind::Rotate => ButtplugCommand::Rotate {
+            speed: magnitude,
+            clockwise: true,
+            duration_ms: event.duration_ms,
+        },
+    })
 }
 
 fn parse_device_id(device_id: &str) -> Result<(DeviceLookup, Option<u32>)> {
@@ -289,6 +450,8 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[test]
     fn startup_and_teardown_are_safe_before_connection() {
@@ -464,5 +627,53 @@ mod tests {
             resolved,
             vec!["7/0".to_string(), "Lovense%20Nora/0".to_string()]
         );
+    }
+
+    #[test]
+    fn translate_linear_event_into_linear_command() {
+        let event = Event::new(80, 0.75, 0);
+        assert_eq!(
+            translate_event(ActuatorKind::Linear, &event),
+            Some(ButtplugCommand::Linear {
+                position: 0.75,
+                duration_ms: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn translate_vibrate_event_into_vibrate_command() {
+        let event = Event::new(80, 0.50, 0);
+        assert_eq!(
+            translate_event(ActuatorKind::Vibrate, &event),
+            Some(ButtplugCommand::Vibrate {
+                magnitude: 0.50,
+                frequency: 0.50,
+            })
+        );
+    }
+
+    #[test]
+    fn startup_processes_queued_events_and_teardown_stops_processing() {
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
+
+        backend.startup().unwrap();
+        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 0);
+
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+
+        for _ in 0..100 {
+            if backend.processed_jobs.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
+
+        backend.teardown().unwrap();
+        backend.send_event("0".to_string(), &Event::new(50, 1.0, 0));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(backend.processed_jobs.load(Ordering::SeqCst), 1);
     }
 }
