@@ -6,8 +6,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use buttplug_client::ButtplugClient;
+use buttplug_client::connector::ButtplugRemoteClientConnector;
+use buttplug_client::device::{ClientDeviceCommandValue, ClientDeviceOutputCommand};
+use buttplug_client::serializer::ButtplugClientJSONSerializer;
+use buttplug_client::{ButtplugClientDevice, ButtplugClientEvent};
 use buttplug_core::message::OutputType;
-use tokio::sync::{mpsc, oneshot};
+use buttplug_transport_websocket_tungstenite::ButtplugWebsocketClientTransport;
+use futures::StreamExt;
+use strum::IntoEnumIterator;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::backend::{Backend, DeviceList};
 use crate::config::ButtplugConfig;
@@ -126,10 +134,21 @@ impl ButtplugBackend {
 
         let device_cache = Arc::clone(&self.device_cache);
         let processed_jobs = Arc::clone(&self.processed_jobs);
+        let dropped_disconnected = Arc::clone(&self.dropped_disconnected);
+        let dropped_unknown_device = Arc::clone(&self.dropped_unknown_device);
+        let config = self.config.clone();
         let worker = std::thread::Builder::new()
             .name("buttplug-backend".to_string())
             .spawn(move || {
-                runtime.block_on(run_worker(rx, shutdown_rx, device_cache, processed_jobs));
+                runtime.block_on(run_worker(
+                    rx,
+                    shutdown_rx,
+                    device_cache,
+                    processed_jobs,
+                    dropped_disconnected,
+                    dropped_unknown_device,
+                    config,
+                ));
             })?;
 
         *state = WorkerState::Running {
@@ -186,7 +205,12 @@ impl ButtplugBackend {
     }
 
     #[cfg(test)]
-    fn seed_device(&self, lookup: DeviceLookup, device_index: u32, actuator_kinds: Vec<ActuatorKind>) {
+    fn seed_device(
+        &self,
+        lookup: DeviceLookup,
+        device_index: u32,
+        actuator_kinds: Vec<ActuatorKind>,
+    ) {
         self.seed_device_aliases(vec![lookup], device_index, actuator_kinds);
     }
 
@@ -385,14 +409,30 @@ async fn run_worker(
     mut shutdown_rx: oneshot::Receiver<()>,
     device_cache: Arc<Mutex<DeviceCache>>,
     processed_jobs: Arc<AtomicUsize>,
+    dropped_disconnected: Arc<AtomicUsize>,
+    dropped_unknown_device: Arc<AtomicUsize>,
+    config: ButtplugConfig,
 ) {
+    let (client_tx, client_rx) = watch::channel(None);
+    let connection_task = tokio::spawn(connection_manager(
+        config,
+        Arc::clone(&device_cache),
+        client_tx,
+    ));
+
     let mut shutdown_requested = false;
     loop {
         if shutdown_requested {
             match rx.try_recv() {
                 Ok(job) => {
                     processed_jobs.fetch_add(1, Ordering::SeqCst);
-                    handle_job(&device_cache, job);
+                    handle_job(
+                        &device_cache,
+                        client_rx.borrow().as_ref(),
+                        &dropped_disconnected,
+                        &dropped_unknown_device,
+                        job,
+                    );
                     continue;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -402,7 +442,7 @@ async fn run_worker(
 
         tokio::select! {
             _ = &mut shutdown_rx => {
-                eprintln!("buttplug backend: shutdown requested");
+                log::info!("buttplug backend: shutdown requested");
                 shutdown_requested = true;
             }
             maybe_job = rx.recv() => {
@@ -410,48 +450,263 @@ async fn run_worker(
                     break;
                 };
                 processed_jobs.fetch_add(1, Ordering::SeqCst);
-                handle_job(&device_cache, job);
+                handle_job(
+                    &device_cache,
+                    client_rx.borrow().as_ref(),
+                    &dropped_disconnected,
+                    &dropped_unknown_device,
+                    job,
+                );
             }
         }
     }
+
+    connection_task.abort();
 }
 
-fn handle_job(device_cache: &Arc<Mutex<DeviceCache>>, job: GestureJob) {
-    let cache = device_cache.lock().unwrap();
-    let Some(device) = cache.get(&job.lookup) else {
-        eprintln!("buttplug backend: unknown device lookup {:?}", job.lookup);
-        return;
-    };
+fn handle_job(
+    device_cache: &Arc<Mutex<DeviceCache>>,
+    client: Option<&Arc<ButtplugClient>>,
+    dropped_disconnected: &AtomicUsize,
+    dropped_unknown_device: &AtomicUsize,
+    job: GestureJob,
+) {
+    let device_index = {
+        let cache = device_cache.lock().unwrap();
+        let Some(device) = cache.get(&job.lookup) else {
+            let known: Vec<&DeviceLookup> = cache.keys().collect();
+            log::error!(
+                "buttplug backend: unknown device lookup {:?} (known devices: {:?})",
+                job.lookup,
+                known
+            );
+            return;
+        };
 
-    let actuator = match job.actuator_index {
-        Some(index) => device
-            .actuators
-            .iter()
-            .copied()
-            .find(|actuator| actuator.index == index),
-        None => choose_actuator(&device.actuators, None),
-    };
+        let actuator = match job.actuator_index {
+            Some(index) => device
+                .actuators
+                .iter()
+                .copied()
+                .find(|actuator| actuator.index == index),
+            None => choose_actuator(&device.actuators, None),
+        };
 
-    let Some(actuator) = actuator else {
-        eprintln!(
-            "buttplug backend: device {:?} has no usable actuators",
+        let Some(actuator) = actuator else {
+            log::warn!(
+                "buttplug backend: device {:?} has no usable actuators",
+                job.lookup
+            );
+            return;
+        };
+
+        let Some(command) = translate_event(actuator.kind, &job.event) else {
+            log::warn!(
+                "buttplug backend: unsupported actuator kind {:?} for device {:?}",
+                actuator.kind,
+                job.lookup
+            );
+            return;
+        };
+
+        log::debug!(
+            "buttplug backend: dispatch {:?} actuator {} as {:?}",
+            job.lookup,
+            actuator.index,
+            command
+        );
+
+        (device.device_index, actuator.index, command)
+    };
+    let (device_index, feature_index, command) = device_index;
+
+    let Some(client) = client else {
+        let dropped = dropped_disconnected.fetch_add(1, Ordering::SeqCst) + 1;
+        log::warn!(
+            "buttplug backend: dropped job for device {:?} (not connected, dropped_disconnected={dropped})",
             job.lookup
         );
         return;
     };
 
-    let Some(command) = translate_event(actuator.kind, &job.event) else {
-        eprintln!(
-            "buttplug backend: unsupported actuator kind {:?} for device {:?}",
-            actuator.kind, job.lookup
+    let Some(device) = client.devices().get(&device_index).cloned() else {
+        let dropped = dropped_unknown_device.fetch_add(1, Ordering::SeqCst) + 1;
+        log::warn!(
+            "buttplug backend: device index {device_index} not present on server (dropped_unknown_device={dropped})"
         );
         return;
     };
 
-    eprintln!(
-        "buttplug backend: dispatch {:?} actuator {} as {:?}",
-        job.lookup, actuator.index, command
-    );
+    let Some(feature) = device.device_features().get(&feature_index).cloned() else {
+        let dropped = dropped_unknown_device.fetch_add(1, Ordering::SeqCst) + 1;
+        log::warn!(
+            "buttplug backend: feature {feature_index} not present on device {device_index} (dropped_unknown_device={dropped})"
+        );
+        return;
+    };
+
+    let output_command = match command {
+        ButtplugCommand::Vibrate { magnitude } => {
+            ClientDeviceOutputCommand::Vibrate(ClientDeviceCommandValue::Percent(magnitude as f64))
+        }
+        ButtplugCommand::Rotate { speed } => {
+            ClientDeviceOutputCommand::Rotate(ClientDeviceCommandValue::Percent(speed as f64))
+        }
+        ButtplugCommand::Linear {
+            position,
+            duration_ms,
+        } => ClientDeviceOutputCommand::HwPositionWithDuration(
+            ClientDeviceCommandValue::Percent(position as f64),
+            duration_ms,
+        ),
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = feature.run_output(&output_command).await {
+            log::warn!(
+                "buttplug backend: send failed for device {device_index} feature {feature_index}: {e}"
+            );
+        }
+    });
+}
+
+fn build_connector(
+    server: &str,
+) -> ButtplugRemoteClientConnector<ButtplugWebsocketClientTransport, ButtplugClientJSONSerializer> {
+    let transport = if is_secure_websocket(server) {
+        ButtplugWebsocketClientTransport::new_secure_connector(server, false)
+    } else {
+        ButtplugWebsocketClientTransport::new_insecure_connector(server)
+    };
+    ButtplugRemoteClientConnector::<ButtplugWebsocketClientTransport, ButtplugClientJSONSerializer>::new(
+        transport,
+    )
+}
+
+fn device_info_from_client_device(device: &ButtplugClientDevice) -> DeviceInfo {
+    let actuators = device
+        .device_features()
+        .iter()
+        .filter_map(|(feature_index, feature)| {
+            let outputs: Vec<OutputType> = OutputType::iter()
+                .filter(|output_type| feature.feature().contains_output(*output_type))
+                .collect();
+            classify_output_types(&outputs).map(|kind| Actuator {
+                index: *feature_index,
+                kind,
+            })
+        })
+        .collect();
+    DeviceInfo {
+        device_index: device.index(),
+        actuators,
+    }
+}
+
+fn resync_device_cache(device_cache: &Arc<Mutex<DeviceCache>>, client: &ButtplugClient) {
+    let mut new_cache: DeviceCache = HashMap::new();
+    for (_, device) in client.devices() {
+        let info = Arc::new(device_info_from_client_device(&device));
+        new_cache.insert(DeviceLookup::ByIndex(device.index()), Arc::clone(&info));
+        new_cache.insert(DeviceLookup::ByName(device.name().clone()), info);
+    }
+    let count = new_cache.len();
+    *device_cache.lock().unwrap() = new_cache;
+    log::info!("buttplug backend: device cache resynced ({count} lookup entries)");
+}
+
+async fn connection_manager(
+    config: ButtplugConfig,
+    device_cache: Arc<Mutex<DeviceCache>>,
+    client_tx: watch::Sender<Option<Arc<ButtplugClient>>>,
+) {
+    let mut backoff = Backoff::new(config.max_backoff_ms);
+    loop {
+        let client = ButtplugClient::new("haptics-bridge");
+        let connector = build_connector(&config.server);
+        let connect_result = tokio::time::timeout(
+            Duration::from_millis(config.connection_timeout_ms),
+            client.connect(connector),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(())) => {
+                log::info!("buttplug backend: connected to {}", config.server);
+                backoff.reset();
+                let client = Arc::new(client);
+                resync_device_cache(&device_cache, &client);
+                let _ = client_tx.send(Some(Arc::clone(&client)));
+                run_connected_session(&client, &device_cache, &config).await;
+                let _ = client_tx.send(None);
+                log::warn!("buttplug backend: disconnected from {}", config.server);
+            }
+            Ok(Err(e)) => {
+                log::warn!("buttplug backend: connect to {} failed: {e}", config.server);
+            }
+            Err(_) => {
+                log::warn!(
+                    "buttplug backend: connect to {} timed out after {}ms",
+                    config.server,
+                    config.connection_timeout_ms
+                );
+            }
+        }
+
+        let delay = backoff.next();
+        log::info!(
+            "buttplug backend: reconnecting to {} in {delay:?}",
+            config.server
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn run_connected_session(
+    client: &Arc<ButtplugClient>,
+    device_cache: &Arc<Mutex<DeviceCache>>,
+    config: &ButtplugConfig,
+) {
+    let mut events = client.event_stream();
+    if let Err(e) = client.start_scanning().await {
+        log::warn!("buttplug backend: start_scanning failed: {e}");
+    }
+    let mut scan_interval = tokio::time::interval(Duration::from_millis(config.scan_interval_ms));
+    scan_interval.tick().await; // first tick fires immediately; we already scanned above
+
+    loop {
+        tokio::select! {
+            event = events.next() => {
+                match event {
+                    Some(ButtplugClientEvent::DeviceAdded(device)) => {
+                        log::info!("buttplug backend: device added: {}", device.name());
+                        resync_device_cache(device_cache, client);
+                    }
+                    Some(ButtplugClientEvent::DeviceRemoved(device)) => {
+                        log::info!("buttplug backend: device removed: {}", device.name());
+                        resync_device_cache(device_cache, client);
+                    }
+                    Some(ButtplugClientEvent::ServerDisconnect) => {
+                        log::warn!("buttplug backend: server disconnected");
+                        return;
+                    }
+                    Some(_) => {}
+                    None => {
+                        log::warn!("buttplug backend: event stream ended");
+                        return;
+                    }
+                }
+            }
+            _ = scan_interval.tick() => {
+                if let Err(e) = client.start_scanning().await {
+                    log::warn!("buttplug backend: start_scanning failed: {e}");
+                }
+            }
+        }
+        if !client.connected() {
+            return;
+        }
+    }
 }
 
 impl ButtplugBackend {
@@ -674,6 +929,15 @@ mod tests {
     use std::sync::{Arc, mpsc as std_mpsc};
     use std::time::Duration;
 
+    fn no_server_config() -> ButtplugConfig {
+        ButtplugConfig {
+            server: "ws://127.0.0.1:0".to_string(),
+            connection_timeout_ms: 50,
+            max_backoff_ms: 100,
+            scan_interval_ms: 60_000,
+        }
+    }
+
     fn install_running_worker(
         backend: &ButtplugBackend,
         tx: mpsc::Sender<GestureJob>,
@@ -689,7 +953,7 @@ mod tests {
 
     #[test]
     fn startup_and_teardown_are_safe_before_connection() {
-        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let backend = ButtplugBackend::new(no_server_config());
         assert!(backend.startup().is_ok());
         assert!(backend.teardown().is_ok());
     }
@@ -903,7 +1167,7 @@ mod tests {
 
     #[test]
     fn startup_is_atomic_under_concurrent_calls() {
-        let backend = Arc::new(ButtplugBackend::new(ButtplugConfig::default()));
+        let backend = Arc::new(ButtplugBackend::new(no_server_config()));
         let (release_tx, release_rx) = std_mpsc::channel();
         let builder_calls = Arc::new(AtomicUsize::new(0));
 
@@ -979,7 +1243,7 @@ mod tests {
 
     #[test]
     fn startup_processes_queued_events_and_teardown_stops_processing() {
-        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let backend = ButtplugBackend::new(no_server_config());
         backend.seed_device(DeviceLookup::ByIndex(0), 0, vec![ActuatorKind::Vibrate]);
 
         backend.startup().unwrap();
@@ -1045,7 +1309,7 @@ mod tests {
 
     #[test]
     fn startup_failure_does_not_leave_backend_half_initialized() {
-        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        let backend = ButtplugBackend::new(no_server_config());
         backend.seed_device(DeviceLookup::ByIndex(0), 0, vec![ActuatorKind::Vibrate]);
 
         let err = backend
@@ -1144,5 +1408,4 @@ mod tests {
         assert_eq!(telemetry.dropped_disconnected, 0);
         assert_eq!(telemetry.dropped_unknown_device, 0);
     }
-
 }
