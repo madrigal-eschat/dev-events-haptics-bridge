@@ -56,6 +56,7 @@ struct GestureJob {
 
 #[derive(Debug, Clone, Default)]
 struct DeviceInfo {
+    device_index: u32,
     actuators: Vec<Actuator>,
 }
 
@@ -179,12 +180,17 @@ impl ButtplugBackend {
     }
 
     #[cfg(test)]
-    fn seed_device(&self, lookup: DeviceLookup, actuator_kinds: Vec<ActuatorKind>) {
-        self.seed_device_aliases(vec![lookup], actuator_kinds);
+    fn seed_device(&self, lookup: DeviceLookup, device_index: u32, actuator_kinds: Vec<ActuatorKind>) {
+        self.seed_device_aliases(vec![lookup], device_index, actuator_kinds);
     }
 
     #[cfg(test)]
-    fn seed_device_aliases(&self, lookups: Vec<DeviceLookup>, actuator_kinds: Vec<ActuatorKind>) {
+    fn seed_device_aliases(
+        &self,
+        lookups: Vec<DeviceLookup>,
+        device_index: u32,
+        actuator_kinds: Vec<ActuatorKind>,
+    ) {
         let actuators = actuator_kinds
             .into_iter()
             .enumerate()
@@ -193,7 +199,10 @@ impl ButtplugBackend {
                 kind,
             })
             .collect();
-        let device = Arc::new(DeviceInfo { actuators });
+        let device = Arc::new(DeviceInfo {
+            device_index,
+            actuators,
+        });
         let mut cache = self.device_cache.lock().unwrap();
         for lookup in lookups {
             cache.insert(lookup, Arc::clone(&device));
@@ -740,6 +749,7 @@ mod tests {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(
             DeviceLookup::ByIndex(7),
+            0,
             vec![
                 ActuatorKind::Rotate,
                 ActuatorKind::Linear,
@@ -761,6 +771,7 @@ mod tests {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(
             DeviceLookup::ByName("Lovense Nora".into()),
+            0,
             vec![ActuatorKind::Vibrate, ActuatorKind::Linear],
         );
 
@@ -784,7 +795,7 @@ mod tests {
     #[test]
     fn resolve_device_ids_leaves_unknown_and_zero_actuator_devices_unchanged() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
-        backend.seed_device(DeviceLookup::ByIndex(3), vec![]);
+        backend.seed_device(DeviceLookup::ByIndex(3), 0, vec![]);
 
         let ids = vec!["Missing".to_string(), "3".to_string()];
         let resolved = backend.resolve_device_ids(&ids).unwrap();
@@ -797,6 +808,7 @@ mod tests {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
         backend.seed_device(
             DeviceLookup::ByIndex(7),
+            0,
             vec![ActuatorKind::Vibrate, ActuatorKind::Linear],
         );
 
@@ -809,7 +821,7 @@ mod tests {
     #[test]
     fn resolve_device_ids_leaves_explicit_actuator_on_zero_actuator_device_unresolved() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
-        backend.seed_device(DeviceLookup::ByIndex(3), vec![]);
+        backend.seed_device(DeviceLookup::ByIndex(3), 0, vec![]);
 
         let ids = vec!["3/0".to_string()];
         let resolved = backend.resolve_device_ids(&ids).unwrap();
@@ -825,6 +837,7 @@ mod tests {
                 DeviceLookup::ByIndex(7),
                 DeviceLookup::ByName("Lovense Nora".into()),
             ],
+            0,
             vec![ActuatorKind::Vibrate, ActuatorKind::Linear],
         );
 
@@ -916,7 +929,7 @@ mod tests {
     #[test]
     fn startup_processes_queued_events_and_teardown_stops_processing() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
-        backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
+        backend.seed_device(DeviceLookup::ByIndex(0), 0, vec![ActuatorKind::Vibrate]);
 
         backend.startup().unwrap();
         assert_eq!(backend.telemetry().processed_jobs, 0);
@@ -982,7 +995,7 @@ mod tests {
     #[test]
     fn startup_failure_does_not_leave_backend_half_initialized() {
         let backend = ButtplugBackend::new(ButtplugConfig::default());
-        backend.seed_device(DeviceLookup::ByIndex(0), vec![ActuatorKind::Vibrate]);
+        backend.seed_device(DeviceLookup::ByIndex(0), 0, vec![ActuatorKind::Vibrate]);
 
         let err = backend
             .startup_with_runtime(|| Err(anyhow::anyhow!("runtime build failed")))
