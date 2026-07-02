@@ -59,6 +59,20 @@ impl Config {
                 );
             }
         }
+        if let Some(buttplug) = &self.buttplug {
+            if buttplug.scan_interval_ms == 0 {
+                bail!(
+                    "buttplug.scan_interval_ms must be > 0 (got {})",
+                    buttplug.scan_interval_ms,
+                );
+            }
+            if buttplug.connection_timeout_ms == 0 {
+                bail!(
+                    "buttplug.connection_timeout_ms must be > 0 (got {})",
+                    buttplug.connection_timeout_ms,
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -398,6 +412,37 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("needs 1"));
+    }
+
+    #[test]
+    fn validate_buttplug_valid() {
+        let mut c = cfg(vec![valid()]);
+        c.buttplug = Some(ButtplugConfig::default());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_buttplug_scan_interval_zero() {
+        let mut c = cfg(vec![valid()]);
+        c.buttplug = Some(ButtplugConfig {
+            scan_interval_ms: 0,
+            ..ButtplugConfig::default()
+        });
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("scan_interval_ms"));
+        assert!(err.to_string().contains('0'));
+    }
+
+    #[test]
+    fn validate_buttplug_connection_timeout_zero() {
+        let mut c = cfg(vec![valid()]);
+        c.buttplug = Some(ButtplugConfig {
+            connection_timeout_ms: 0,
+            ..ButtplugConfig::default()
+        });
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("connection_timeout_ms"));
+        assert!(err.to_string().contains('0'));
     }
 
     #[test]
