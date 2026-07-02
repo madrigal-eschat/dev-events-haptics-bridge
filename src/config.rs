@@ -9,6 +9,7 @@ pub struct Config {
     pub topics: Vec<String>,
     pub rules: Vec<Rule>,
     pub http: Option<HttpConfig>,
+    pub buttplug: Option<ButtplugConfig>,
 }
 
 impl Config {
@@ -93,6 +94,45 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             bind: default_http_bind(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ButtplugConfig {
+    #[serde(default = "default_buttplug_server")]
+    pub server: String,
+    #[serde(default = "default_buttplug_connection_timeout_ms")]
+    pub connection_timeout_ms: u64,
+    #[serde(default = "default_buttplug_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+    #[serde(default = "default_buttplug_scan_interval_ms")]
+    pub scan_interval_ms: u64,
+}
+
+fn default_buttplug_server() -> String {
+    "ws://localhost:12345".to_string()
+}
+
+fn default_buttplug_connection_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_buttplug_max_backoff_ms() -> u64 {
+    30000
+}
+
+fn default_buttplug_scan_interval_ms() -> u64 {
+    30000
+}
+
+impl Default for ButtplugConfig {
+    fn default() -> Self {
+        Self {
+            server: default_buttplug_server(),
+            connection_timeout_ms: default_buttplug_connection_timeout_ms(),
+            max_backoff_ms: default_buttplug_max_backoff_ms(),
+            scan_interval_ms: default_buttplug_scan_interval_ms(),
         }
     }
 }
@@ -257,6 +297,7 @@ mod tests {
             topics: vec![],
             rules,
             http: None,
+            buttplug: None,
         }
     }
 
@@ -639,6 +680,44 @@ http:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.http.unwrap().bind, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn parse_config_without_buttplug_section() {
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.buttplug.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_buttplug_defaults() {
+        let yaml = r#"
+broker:
+  host: localhost
+topics: []
+rules: []
+buttplug: {}
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let buttplug = cfg.buttplug.unwrap();
+        assert_eq!(buttplug.server, "ws://localhost:12345");
+        assert_eq!(buttplug.connection_timeout_ms, 5000);
+        assert_eq!(buttplug.max_backoff_ms, 30000);
+        assert_eq!(buttplug.scan_interval_ms, 30000);
+    }
+
+    #[test]
+    fn buttplug_config_default_yields_documented_values() {
+        let buttplug = ButtplugConfig::default();
+        assert_eq!(buttplug.server, "ws://localhost:12345");
+        assert_eq!(buttplug.connection_timeout_ms, 5000);
+        assert_eq!(buttplug.max_backoff_ms, 30000);
+        assert_eq!(buttplug.scan_interval_ms, 30000);
     }
 
     #[test]

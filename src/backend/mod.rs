@@ -1,5 +1,6 @@
 use crate::gestures::Event;
 
+pub mod buttplug;
 pub mod http;
 
 pub enum DeviceList {
@@ -17,6 +18,7 @@ pub trait Backend: Send + Sync {
     fn validate_device(&self, device_id: &str) -> anyhow::Result<()>;
 
     fn list_devices(&self) -> anyhow::Result<DeviceList>;
+    fn resolve_device_ids(&self, device_ids: &[String]) -> anyhow::Result<Vec<String>>;
     fn send_event(&self, device_id: String, event: &Event);
 }
 
@@ -44,13 +46,17 @@ impl Backend for StdoutBackend {
         Ok(DeviceList::Anything)
     }
 
+    fn resolve_device_ids(&self, device_ids: &[String]) -> anyhow::Result<Vec<String>> {
+        Ok(device_ids.to_vec())
+    }
+
     fn send_event(&self, device_id: String, event: &Event) {
         println!("{device_id} {event:?}");
     }
 }
 
 pub fn is_known(name: &str) -> bool {
-    matches!(name, "stdout" | "http")
+    matches!(name, "stdout" | "http" | "buttplug")
 }
 
 pub fn create(name: &str, config: &crate::config::Config) -> anyhow::Result<Box<dyn Backend>> {
@@ -59,6 +65,10 @@ pub fn create(name: &str, config: &crate::config::Config) -> anyhow::Result<Box<
         "http" => {
             let bind = config.http.clone().unwrap_or_default().bind;
             Ok(Box::new(http::HttpBackend::new(bind)))
+        }
+        "buttplug" => {
+            let config = config.buttplug.clone().unwrap_or_default();
+            Ok(Box::new(buttplug::ButtplugBackend::new(config)))
         }
         other => anyhow::bail!("unknown backend: {other}"),
     }
@@ -80,6 +90,7 @@ mod tests {
             topics: vec![],
             rules: vec![],
             http: None,
+            buttplug: None,
         }
     }
 
@@ -87,6 +98,7 @@ mod tests {
     fn create_known_backends_succeed() {
         assert!(create("stdout", &test_config()).is_ok());
         assert!(create("http", &test_config()).is_ok());
+        assert!(create("buttplug", &test_config()).is_ok());
     }
 
     #[test]
@@ -98,9 +110,10 @@ mod tests {
     }
 
     #[test]
-    fn is_known_stdout_and_http() {
+    fn is_known_stdout_http_and_buttplug() {
         assert!(is_known("stdout"));
         assert!(is_known("http"));
+        assert!(is_known("buttplug"));
         assert!(!is_known("nonexistent"));
         assert!(!is_known("STDOUT"));
     }
@@ -112,6 +125,11 @@ mod tests {
             bind: "127.0.0.1:9999".to_string(),
         });
         assert!(create("http", &config).is_ok());
+    }
+
+    #[test]
+    fn create_buttplug_uses_default_config() {
+        assert!(create("buttplug", &test_config()).is_ok());
     }
 
     #[test]
