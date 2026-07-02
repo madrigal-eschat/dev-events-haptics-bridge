@@ -144,10 +144,11 @@ impl Backend for ButtplugBackend {
                         &device.actuators,
                         selected.entry(lookup.clone()).or_default(),
                     );
-                    let Some(chosen) = chosen else {
-                        resolved.push(raw);
-                        continue;
-                    };
+                    debug_assert!(
+                        chosen.is_some(),
+                        "choose_actuator returned None for non-empty device actuators in device id '{raw}'"
+                    );
+                    let chosen = chosen.unwrap_or_else(|| device.actuators[0]);
                     selected.get_mut(&lookup).unwrap().insert(chosen);
                     resolved.push(format_device_id(&lookup, Some(chosen.index)));
                 }
@@ -175,7 +176,7 @@ fn parse_device_id(device_id: &str) -> Result<(DeviceLookup, Option<u32>)> {
         bail!("invalid device id '{device_id}'");
     }
 
-    let lookup = percent_decode(lookup)?;
+    let lookup = percent_decode(lookup, device_id)?;
     if lookup.is_empty() {
         bail!("empty device lookup in device id '{device_id}'");
     }
@@ -212,7 +213,7 @@ fn choose_actuator(actuators: &[Actuator], selected: &HashSet<Actuator>) -> Opti
     actuators.first().copied()
 }
 
-fn percent_decode(input: &str) -> Result<String> {
+fn percent_decode(input: &str, device_id: &str) -> Result<String> {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -220,13 +221,17 @@ fn percent_decode(input: &str) -> Result<String> {
         match bytes[index] {
             b'%' => {
                 let hi = *bytes.get(index + 1).ok_or_else(|| {
-                    anyhow::anyhow!("invalid percent-encoding in device id '{input}'")
+                    anyhow::anyhow!(
+                        "invalid percent-encoding in device lookup '{input}' (device id '{device_id}')"
+                    )
                 })?;
                 let lo = *bytes.get(index + 2).ok_or_else(|| {
-                    anyhow::anyhow!("invalid percent-encoding in device id '{input}'")
+                    anyhow::anyhow!(
+                        "invalid percent-encoding in device lookup '{input}' (device id '{device_id}')"
+                    )
                 })?;
-                let hi = hex_value(hi)?;
-                let lo = hex_value(lo)?;
+                let hi = hex_value(hi, input, device_id)?;
+                let lo = hex_value(lo, input, device_id)?;
                 decoded.push((hi << 4) | lo);
                 index += 3;
             }
@@ -261,12 +266,15 @@ fn is_unreserved(byte: u8) -> bool {
     )
 }
 
-fn hex_value(byte: u8) -> Result<u8> {
+fn hex_value(byte: u8, input: &str, device_id: &str) -> Result<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => bail!("invalid percent-encoding"),
+        _ => bail!(
+            "invalid hex digit '{}' in device lookup '{input}' (device id '{device_id}')",
+            byte as char
+        ),
     }
 }
 
@@ -344,7 +352,16 @@ mod tests {
 
     #[test]
     fn parse_device_id_rejects_bad_percent_encoding() {
-        assert!(parse_device_id("broken%2").is_err());
+        let err = parse_device_id("broken%2").unwrap_err().to_string();
+        assert!(err.contains("device lookup 'broken%2'"));
+        assert!(err.contains("device id 'broken%2'"));
+    }
+
+    #[test]
+    fn parse_device_id_rejects_bad_percent_encoding_with_invalid_hex_digit() {
+        let err = parse_device_id("broken%2Z").unwrap_err().to_string();
+        assert!(err.contains("device lookup 'broken%2Z'"));
+        assert!(err.contains("invalid hex digit 'Z'"));
     }
 
     #[test]
