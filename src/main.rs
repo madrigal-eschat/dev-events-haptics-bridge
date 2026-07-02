@@ -14,14 +14,43 @@ use gestures::{lookup, scale};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
+
     let config_path = std::env::args()
         .nth(1)
         .context("usage: haptics <config.yaml>")?;
+    log::debug!("reading config from {config_path}");
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {config_path}"))?;
+    log::debug!("parsing config ({} bytes)", config_str.len());
     let config: Config = serde_yaml::from_str(&config_str).context("failed to parse config")?;
 
+    log::debug!("validating config");
     config.validate()?;
+    log::info!("config valid");
+
+    log::info!(
+        "broker: host={} port={} client_id={} auth={}",
+        config.broker.host,
+        config.broker.port,
+        config
+            .broker
+            .client_id
+            .as_deref()
+            .unwrap_or("haptics-bridge"),
+        config.broker.auth.is_some(),
+    );
+    log::info!("subscribing to topics: {:?}", config.topics);
+
+    log::info!("loaded {} rule(s) from {config_path}", config.rules.len());
+    for (index, rule) in config.rules.iter().enumerate() {
+        log::info!(
+            "rule[{index}]: filter={:?} gesture={:?} devices={:?}",
+            rule.filter,
+            rule.gesture,
+            rule.device_spec.as_slice()
+        );
+    }
 
     // Build one backend instance per unique backend name.
     let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
@@ -69,6 +98,12 @@ async fn main() -> Result<()> {
     let mqtt_loop = async {
         loop {
             if let MqttEvent::Incoming(Packet::Publish(p)) = eventloop.poll().await? {
+                log::debug!(
+                    "received message on {} ({} bytes)",
+                    p.topic,
+                    p.payload.len()
+                );
+
                 let payload = match std::str::from_utf8(&p.payload) {
                     Ok(s) => s,
                     Err(_) => {
@@ -84,14 +119,30 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                for rule in &config.rules {
+                let mut matched_any = false;
+                for (index, rule) in config.rules.iter().enumerate() {
                     if !rule.filter.matches(&cloud_event) {
                         continue;
                     }
+                    matched_any = true;
 
                     let base = lookup(&rule.gesture.name).expect("validated at startup");
                     let events = scale(base, rule.gesture.speed, rule.gesture.scale);
+                    log::debug!(
+                        "rule[{index}] matched event {:?} on {}: dispatching gesture '{}' to {:?}",
+                        cloud_event.type_,
+                        p.topic,
+                        rule.gesture.name,
+                        rule.device_spec.as_slice()
+                    );
                     dispatch_rule(&backends, rule.device_spec.as_slice(), &events)?;
+                }
+                if !matched_any {
+                    log::debug!(
+                        "no rule matched event {:?} on {}",
+                        cloud_event.type_,
+                        p.topic
+                    );
                 }
             }
         }
@@ -120,12 +171,13 @@ fn dispatch_rule(
     events: &[gestures::Event],
 ) -> Result<()> {
     let first_device = devices.first().context("rule has empty device list")?;
-    let (backend_name, _) = first_device
+    let (backend_name, first_local_id) = first_device
         .split_once('/')
         .with_context(|| format!("invalid device address '{first_device}'"))?;
 
+    let mut local_devices = vec![first_local_id.to_string()];
     for addr in devices.iter().skip(1) {
-        let (device_backend, _) = addr
+        let (device_backend, local_id) = addr
             .split_once('/')
             .with_context(|| format!("invalid device address '{addr}'"))?;
         if device_backend != backend_name {
@@ -133,12 +185,13 @@ fn dispatch_rule(
                 "rule mixes backends: '{backend_name}' and '{device_backend}' in devices {devices:?}"
             );
         }
+        local_devices.push(local_id.to_string());
     }
 
     let backend = backends
         .get(backend_name)
         .with_context(|| format!("backend '{backend_name}' not initialized"))?;
-    let resolved_devices = backend.resolve_device_ids(devices)?;
+    let resolved_devices = backend.resolve_device_ids(&local_devices)?;
     for haptic_event in events {
         let device_index = haptic_event.device as usize;
         let device_id = resolved_devices.get(device_index).with_context(|| {
@@ -233,7 +286,11 @@ mod tests {
 
         dispatch_rule(&backends, &devices, &events).unwrap();
 
-        assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
+        let local_devices = vec!["0".to_string(), "1".to_string(), "2".to_string()];
+        assert_eq!(
+            handle.resolve_calls.lock().unwrap().as_slice(),
+            &[local_devices]
+        );
         assert_eq!(
             handle.sent_device_ids.lock().unwrap().as_slice(),
             &[
@@ -278,6 +335,39 @@ mod tests {
 
         let err = dispatch_rule(&backends, &devices, &events).expect_err("expected bounds error");
         assert!(err.to_string().contains("device index 1"), "{err}");
-        assert_eq!(handle.resolve_calls.lock().unwrap().as_slice(), &[devices]);
+        let local_devices = vec!["0".to_string(), "1".to_string()];
+        assert_eq!(
+            handle.resolve_calls.lock().unwrap().as_slice(),
+            &[local_devices]
+        );
+    }
+
+    #[test]
+    fn dispatch_rule_strips_backend_prefix_for_named_buttplug_devices() {
+        use crate::backend::Backend as _;
+        use crate::backend::buttplug::ButtplugBackend;
+        use crate::config::ButtplugConfig;
+
+        let backend = ButtplugBackend::new(ButtplugConfig::default());
+        backend.startup().unwrap();
+
+        let mut backends: HashMap<String, Box<dyn backend::Backend>> = HashMap::new();
+        backends.insert("buttplug".to_string(), Box::new(backend));
+
+        // A device name containing a space, addressed with its own '/'-separated
+        // actuator index and the rule's "BACKEND/ID" prefix in front of that —
+        // regression test for a bug where the backend prefix wasn't stripped
+        // before being handed to the backend, so "buttplug/Lovense Edge/0" was
+        // parsed as a single opaque device id and rejected.
+        let devices = vec![
+            "buttplug/Lovense Edge/0".to_string(),
+            "buttplug/Lovense Edge/1".to_string(),
+        ];
+        let events = vec![
+            gestures::Event::new(50, 1.0, 0),
+            gestures::Event::new(50, 1.0, 1),
+        ];
+
+        dispatch_rule(&backends, &devices, &events).unwrap();
     }
 }

@@ -26,6 +26,7 @@ pub struct StdoutBackend;
 
 impl Backend for StdoutBackend {
     fn startup(&self) -> anyhow::Result<()> {
+        log::info!("stdout backend: starting (no configuration)");
         Ok(())
     }
 
@@ -51,6 +52,7 @@ impl Backend for StdoutBackend {
     }
 
     fn send_event(&self, device_id: String, event: &Event) {
+        log::debug!("stdout backend: send_event device={device_id} event={event:?}");
         println!("{device_id} {event:?}");
     }
 }

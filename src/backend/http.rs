@@ -50,6 +50,8 @@ fn build_router(events: EventBuffer) -> Router {
 
 impl Backend for HttpBackend {
     fn startup(&self) -> Result<()> {
+        log::info!("http backend: starting with bind={}", self.bind);
+
         let std_listener = std::net::TcpListener::bind(&self.bind)
             .with_context(|| format!("http backend: failed to bind {}", self.bind))?;
         std_listener
@@ -108,6 +110,7 @@ impl Backend for HttpBackend {
     }
 
     fn send_event(&self, device_id: String, event: &Event) {
+        log::debug!("http backend: send_event device={device_id} event={event:?}");
         let mut events = self.events.lock().unwrap();
         events.push_back(format!("{device_id} {event:?}"));
         while events.len() > MAX_EVENTS {
