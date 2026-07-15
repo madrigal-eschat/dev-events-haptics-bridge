@@ -1,3 +1,20 @@
+# [1.2.0](https://github.com/madrigal-eschat/dev-events-haptics-bridge/compare/v1.1.0...v1.2.0) (2026-07-15)
+
+
+### Bug Fixes
+
+* silence dead_code lint on not-yet-consumed mock server module ([c7ceae1](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/c7ceae119fe6faf469dde5e77f1d25accd66b3ce))
+* strip backend prefix from device ids before dispatch ([d5a1028](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/d5a1028c9746a4fd4950a5240825a0668d325fe6))
+* validate buttplug scan_interval_ms and connection_timeout_ms are nonzero ([d548171](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/d54817147f71a4b0dd634c497fae388e79be9020))
+
+
+### Features
+
+* add dropped_disconnected/dropped_unknown_device telemetry counters ([804d23d](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/804d23dbd287f843e26ed02280fdaab2250dad85))
+* add websocket scheme detection and reconnect backoff helpers ([14c40f3](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/14c40f325d2d36448af9819093256f4f3f337837))
+* classify real device feature output types into ActuatorKind ([e29dcb0](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/e29dcb08b86c3c6e14b24897ae07b64cf2404a2f))
+* wire buttplug backend to a real Intiface connection ([7bf2498](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/7bf2498aadf869b13e0d3919fcd75621cac6f4a5))
+
 # [1.1.0](https://github.com/madrigal-eschat/dev-events-haptics-bridge/compare/v1.0.0...v1.1.0) (2026-07-02)
 
 
