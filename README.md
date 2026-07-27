@@ -2,7 +2,8 @@
 
 MQTT-driven haptics dispatcher. Subscribes to a broker, matches incoming
 CloudEvents against rules from a YAML config, and plays haptic gestures on
-one or more hardware backends.
+one or more hardware backends. `buttplug` is the only currently supported
+backend for real hardware.
 
 **Data flow**: MQTT message → deserialize `CloudEvent` → match against
 `Rule[]` → look up gesture → scale timing/magnitude → send to backend.
@@ -74,9 +75,9 @@ A device is addressed as `BACKEND/ID`, e.g. `stdout/0` or
 
 ### Backends
 
-- `stdout` — prints events to stdout; no config needed.
-- `http` — exposes an HTTP endpoint for external consumers; configured via the `http:` section.
-- `buttplug` — connects to an Intiface/buttplug server over WebSocket; configured via the `buttplug:` section.
+- `buttplug` — connects to an Intiface/buttplug server over WebSocket; the only backend intended for real hardware; configured via the `buttplug:` section.
+- `stdout` — prints events to stdout; testing/development only, no config needed.
+- `http` — exposes an HTTP endpoint for external consumers; testing/development only; configured via the `http:` section.
 
 ### Gestures
 
