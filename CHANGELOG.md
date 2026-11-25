@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/madrigal-eschat/dev-events-haptics-bridge/compare/v1.2.0...v1.2.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **buttplug:** time gesture playback and stop idle actuators ([795b1d1](https://github.com/madrigal-eschat/dev-events-haptics-bridge/commit/795b1d1da922e024e0b8ac441731b9597f526635))
+
 # [1.2.0](https://github.com/madrigal-eschat/dev-events-haptics-bridge/compare/v1.1.0...v1.2.0) (2026-07-15)
 
 
