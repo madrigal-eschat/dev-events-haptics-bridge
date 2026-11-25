@@ -171,6 +171,24 @@ pub fn scale(events: &[Event], speed: f32, magnitude_scale: f32) -> Vec<Event> {
 }
 
 #[cfg(test)]
+pub(crate) const BUILT_IN_GESTURE_NAMES: &[&str] = &[
+    "pulse_short",
+    "pulse_medium",
+    "pulse_long",
+    "double_short",
+    "triple_short",
+    "triple_slow",
+    "both_medium",
+    "both_long",
+    "crossfade_medium",
+    "crossfade_long",
+    "both_double_short",
+    "alternate_double_short",
+    "stop",
+    "stop_all",
+];
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -178,23 +196,7 @@ mod tests {
 
     #[test]
     fn lookup_all_named_gestures() {
-        let names = [
-            "pulse_short",
-            "pulse_medium",
-            "pulse_long",
-            "double_short",
-            "triple_short",
-            "triple_slow",
-            "both_medium",
-            "both_long",
-            "crossfade_medium",
-            "crossfade_long",
-            "both_double_short",
-            "alternate_double_short",
-            "stop",
-            "stop_all",
-        ];
-        for name in names {
+        for name in BUILT_IN_GESTURE_NAMES {
             assert!(lookup(name).is_some(), "lookup({name}) returned None");
         }
     }

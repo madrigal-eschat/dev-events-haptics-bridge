@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub struct MockButtplugServer {
     pub addr: SocketAddr,
-    pub output_cmds: mpsc::UnboundedReceiver<OutputCommand>,
+    pub output_cmds: mpsc::UnboundedReceiver<(u32, OutputCommand)>,
     task: JoinHandle<()>,
 }
 
@@ -42,10 +42,17 @@ fn fake_vibrator_device_list() -> DeviceListV4 {
         DeviceFeatureOutputValueProperties::new(RangeInclusive::new(0, 20)),
     )]);
     let mut features: BTreeMap<u32, DeviceFeature> = BTreeMap::new();
-    features.insert(
-        0,
-        DeviceFeature::new(0, "Vibrator", &output, &SmallVecEnumMap::from(Vec::new())),
-    );
+    for index in 0..2 {
+        features.insert(
+            index,
+            DeviceFeature::new(
+                index,
+                "Vibrator",
+                &output,
+                &SmallVecEnumMap::from(Vec::new()),
+            ),
+        );
+    }
     let info = DeviceMessageInfoV4::new(0, "Test Vibrator", &None, 0, &features);
     DeviceListV4::new(vec![info])
 }
@@ -100,7 +107,7 @@ async fn start_with_listener(listener: TcpListener) -> MockButtplugServer {
                         responses.push(ButtplugServerMessageV4::DeviceList(list));
                     }
                     ButtplugClientMessageV4::OutputCmd(cmd) => {
-                        let _ = output_tx.send(cmd.command());
+                        let _ = output_tx.send((cmd.feature_index(), cmd.command()));
                         responses.push(ButtplugServerMessageV4::Ok(OkV0::new(id)));
                     }
                     _ => {

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use buttplug_client::ButtplugClient;
 use buttplug_client::connector::ButtplugRemoteClientConnector;
-use buttplug_client::device::{ClientDeviceCommandValue, ClientDeviceOutputCommand};
+use buttplug_client::device::{
+    ClientDeviceCommandValue, ClientDeviceFeature, ClientDeviceOutputCommand,
+};
 use buttplug_client::serializer::ButtplugClientJSONSerializer;
 use buttplug_client::{ButtplugClientDevice, ButtplugClientEvent};
 use buttplug_core::message::OutputType;
@@ -50,7 +52,7 @@ pub struct ButtplugTelemetry {
     dropped_unknown_device: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ButtplugCommand {
     Vibrate { magnitude: f32 },
     Linear { position: f32, duration_ms: u32 },
@@ -71,6 +73,14 @@ struct DeviceInfo {
 }
 
 type DeviceCache = HashMap<DeviceLookup, Arc<DeviceInfo>>;
+
+// All addresses for a physical actuator share one playback queue.
+type PlaybackQueues = HashMap<(u32, u32), PlaybackQueue>;
+
+struct PlaybackQueue {
+    tx: mpsc::Sender<(ButtplugCommand, Duration)>,
+    task: tokio::task::JoinHandle<()>,
+}
 
 #[derive(Debug, Default)]
 enum WorkerState {
@@ -413,37 +423,31 @@ async fn run_worker(
     dropped_unknown_device: Arc<AtomicUsize>,
     config: ButtplugConfig,
 ) {
-    let (client_tx, client_rx) = watch::channel(None);
+    let (client_tx, mut client_rx) = watch::channel(None);
     let connection_task = tokio::spawn(connection_manager(
         config,
         Arc::clone(&device_cache),
         client_tx,
     ));
+    let (stop_tx, stop_rx) = watch::channel(());
+    let mut playback = PlaybackQueues::new();
+    let mut client = None;
 
-    let mut shutdown_requested = false;
     loop {
-        if shutdown_requested {
-            match rx.try_recv() {
-                Ok(job) => {
-                    processed_jobs.fetch_add(1, Ordering::SeqCst);
-                    handle_job(
-                        &device_cache,
-                        client_rx.borrow().as_ref(),
-                        &dropped_disconnected,
-                        &dropped_unknown_device,
-                        job,
-                    );
-                    continue;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
         tokio::select! {
+            biased;
             _ = &mut shutdown_rx => {
                 log::info!("buttplug backend: shutdown requested");
-                shutdown_requested = true;
+                break;
+            }
+            changed = client_rx.changed() => {
+                for (_, queue) in playback.drain() {
+                    queue.task.abort();
+                }
+                if changed.is_err() {
+                    break;
+                }
+                client = client_rx.borrow_and_update().clone();
             }
             maybe_job = rx.recv() => {
                 let Some(job) = maybe_job else {
@@ -452,15 +456,25 @@ async fn run_worker(
                 processed_jobs.fetch_add(1, Ordering::SeqCst);
                 handle_job(
                     &device_cache,
-                    client_rx.borrow().as_ref(),
+                    client.as_ref(),
                     &dropped_disconnected,
                     &dropped_unknown_device,
+                    &mut playback,
+                    &stop_rx,
                     job,
                 );
             }
         }
     }
 
+    let _ = stop_tx.send(());
+    let tasks = playback.into_values().map(|queue| queue.task);
+    if tokio::time::timeout(Duration::from_millis(250), futures::future::join_all(tasks))
+        .await
+        .is_err()
+    {
+        log::warn!("buttplug backend: timed out stopping actuator playback");
+    }
     connection_task.abort();
 }
 
@@ -469,6 +483,8 @@ fn handle_job(
     client: Option<&Arc<ButtplugClient>>,
     dropped_disconnected: &AtomicUsize,
     dropped_unknown_device: &AtomicUsize,
+    playback: &mut PlaybackQueues,
+    stop_rx: &watch::Receiver<()>,
     job: GestureJob,
 ) {
     let device_index = {
@@ -545,6 +561,71 @@ fn handle_job(
         return;
     };
 
+    let queue = playback
+        .entry((device_index, feature_index))
+        .or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(64);
+            let task = tokio::spawn(play_actuator(feature, rx, stop_rx.clone()));
+            PlaybackQueue { tx, task }
+        });
+    let duration = Duration::from_millis(u64::from(job.event.duration_ms));
+    if let Err(err) = queue.tx.try_send((command, duration)) {
+        log::warn!(
+            "buttplug backend: failed to queue playback for device {device_index} feature {feature_index}: {err}"
+        );
+    }
+}
+
+async fn play_actuator(
+    feature: ClientDeviceFeature,
+    mut rx: mpsc::Receiver<(ButtplugCommand, Duration)>,
+    mut stop_rx: watch::Receiver<()>,
+) {
+    let mut idle_command = None;
+    tokio::select! {
+        biased;
+        _ = stop_rx.changed() => {}
+        _ = async {
+            let mut next = rx.recv().await;
+            while let Some((command, duration)) = next {
+                idle_command = match command {
+                    ButtplugCommand::Vibrate { .. } => {
+                        Some(ButtplugCommand::Vibrate { magnitude: 0.0 })
+                    }
+                    ButtplugCommand::Rotate { .. } => {
+                        Some(ButtplugCommand::Rotate { speed: 0.0 })
+                    }
+                    _ => None,
+                };
+                let deadline = tokio::time::Instant::now() + duration;
+                if send_output(&feature, command, duration).await && idle_command == Some(command) {
+                    idle_command = None;
+                }
+                tokio::time::sleep_until(deadline).await;
+
+                next = rx.try_recv().ok();
+                if next.is_none() {
+                    if let Some(command) = idle_command
+                        && send_output(&feature, command, Duration::from_millis(100)).await
+                    {
+                        idle_command = None;
+                    }
+                    next = rx.recv().await;
+                }
+            }
+        } => {}
+    }
+
+    if let Some(command) = idle_command {
+        send_output(&feature, command, Duration::from_millis(100)).await;
+    }
+}
+
+async fn send_output(
+    feature: &ClientDeviceFeature,
+    command: ButtplugCommand,
+    response_window: Duration,
+) -> bool {
     let output_command = match command {
         ButtplugCommand::Vibrate { magnitude } => {
             ClientDeviceOutputCommand::Vibrate(ClientDeviceCommandValue::Percent(magnitude as f64))
@@ -561,13 +642,14 @@ fn handle_job(
         ),
     };
 
-    tokio::spawn(async move {
-        if let Err(e) = feature.run_output(&output_command).await {
-            log::warn!(
-                "buttplug backend: send failed for device {device_index} feature {feature_index}: {e}"
-            );
-        }
-    });
+    // The server response must never hold a timed actuator on indefinitely.
+    let timeout = response_window.clamp(Duration::from_millis(1), Duration::from_millis(100));
+    match tokio::time::timeout(timeout, feature.run_output(&output_command)).await {
+        Ok(Ok(())) => return true,
+        Ok(Err(e)) => log::warn!("buttplug backend: send failed for {command:?}: {e}"),
+        Err(_) => log::warn!("buttplug backend: response timed out for {command:?}"),
+    }
+    false
 }
 
 fn build_connector(
@@ -1411,7 +1493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connects_discovers_and_dispatches_to_mock_server() {
+    async fn plays_all_builtin_gestures_through_mock_server() {
         let mut server = buttplug_mock_server::start().await;
         let config = ButtplugConfig {
             server: format!("ws://{}", server.addr),
@@ -1439,20 +1521,69 @@ mod tests {
             "expected device '0' to resolve to a real actuator id once discovered"
         );
 
-        backend.send_event(resolved.unwrap()[0].clone(), &Event::new(50, 0.8, 0));
+        let backends: HashMap<String, Box<dyn Backend>> =
+            HashMap::from([("buttplug".into(), Box::new(backend) as Box<dyn Backend>)]);
 
-        let received = tokio::time::timeout(Duration::from_secs(2), server.output_cmds.recv())
-            .await
-            .expect("mock server should receive an OutputCmd within 2s")
-            .expect("output_cmds channel should not close");
-        match received {
-            OutputCommand::Vibrate(value) => {
-                assert!(value.value() > 0, "expected a nonzero vibrate value");
+        for name in crate::gestures::BUILT_IN_GESTURE_NAMES {
+            let gesture = crate::gestures::lookup(name).unwrap();
+            let device_count =
+                usize::from(gesture.iter().map(|event| event.device).max().unwrap()) + 1;
+            let devices: Vec<_> = (0..device_count)
+                .map(|index| format!("buttplug/0/{index}"))
+                .collect();
+
+            let mut expected = vec![std::collections::VecDeque::new(); device_count];
+            let mut durations = vec![Duration::ZERO; device_count];
+            for event in gesture {
+                let device = usize::from(event.device);
+                expected[device].push_back((event.magnitude, durations[device]));
+                durations[device] += Duration::from_millis(u64::from(event.duration_ms));
             }
-            other => panic!("expected Vibrate output command, got {other:?}"),
+            for (commands, duration) in expected.iter_mut().zip(durations) {
+                if commands.back().unwrap().0 > 0.0 {
+                    commands.push_back((0.0, duration));
+                }
+            }
+
+            let started = Instant::now();
+            crate::dispatch_rule(&backends, &devices, gesture).unwrap();
+            let command_count: usize = expected.iter().map(|commands| commands.len()).sum();
+            let mut seen = vec![false; device_count];
+            for _ in 0..command_count {
+                let (index, output) =
+                    tokio::time::timeout(Duration::from_secs(2), server.output_cmds.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("{name}: timed out waiting for an actuator command")
+                        })
+                        .expect("output_cmds channel should not close");
+                let index = index as usize;
+                let (magnitude, elapsed) = expected[index]
+                    .pop_front()
+                    .unwrap_or_else(|| panic!("{name}: unexpected command for actuator {index}"));
+                let OutputCommand::Vibrate(value) = output else {
+                    panic!("{name}: expected Vibrate output command, got {output:?}");
+                };
+                let expected_value = (f64::from(magnitude) * 20.0).ceil() as i32;
+                assert_eq!(value.value(), expected_value, "{name}: actuator {index}");
+                assert!(
+                    started.elapsed() >= elapsed,
+                    "{name}: actuator {index} fired before {elapsed:?}"
+                );
+                if seen[index] {
+                    assert!(
+                        seen.iter().all(|&started| started),
+                        "{name}: actuators should start in parallel"
+                    );
+                }
+                seen[index] = true;
+            }
         }
 
-        backend.teardown().unwrap();
+        tokio::task::spawn_blocking(move || backends["buttplug"].teardown())
+            .await
+            .unwrap()
+            .unwrap();
         server.stop();
     }
 
